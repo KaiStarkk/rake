@@ -1,0 +1,17 @@
+(* STUB: Image Filters in Rake *)
+(*
+   Image filtering tests:
+   - 2D convolution (blur, sharpen, edge detect)
+   - Memory access patterns (row-major vs tiled)
+   - Boundary handling with rails
+
+   TODO:
+   - Implement 3x3 convolution kernel
+   - Add Gaussian blur, Sobel edge detection
+   - Process 8 pixels horizontally per iteration
+   - Handle image boundaries with rails
+*)
+
+rake convolve_3x3 : float rack -> float rack -> float rack =
+  fun pixels kernel ->
+    pixels  (* Placeholder *)

@@ -1,0 +1,17 @@
+# Build artifacts
+**/_build/
+**/build/
+*.o
+*.ll
+*.s
+
+# Dune
+_opam/
+
+# Nix
+.direnv/
+result
+
+# Benchmark results (keep .gitkeep)
+bench/results/*.json
+bench/results/*.html

@@ -1,0 +1,23 @@
+(* STUB: ML Inference in Rake *)
+(*
+   Neural network inference tests:
+   - Matrix multiplication (GEMM)
+   - Activation functions (ReLU, sigmoid, tanh)
+   - Batch normalization
+   - Convolution layers
+
+   TODO:
+   - Implement matrix-vector multiply
+   - Add activation functions with rails for ReLU
+   - Implement simple MLP forward pass
+   - Process 8 batch elements in parallel
+*)
+
+rake relu : float rack -> float rack =
+  fun x ->
+    | positive := x > 0.0 -> x
+    | otherwise -> 0.0
+
+rake matmul_row : float rack -> float rack -> float rack =
+  fun row weights ->
+    row * weights  (* Placeholder - needs reduction *)

@@ -1,0 +1,19 @@
+(* STUB: N-Body Simulation in Rake *)
+(*
+   N-body tests:
+   - O(n^2) pairwise force computation
+   - Gravitational/electrostatic forces
+   - Position/velocity integration
+
+   TODO:
+   - Implement force accumulation between body pairs
+   - Use blocked algorithm for cache efficiency
+   - Process 8 bodies in parallel
+   - Integrate using Verlet or RK4
+*)
+
+rake compute_force : float rack -> float rack -> float rack ->
+                     float rack -> float rack -> float rack ->
+                     float rack =
+  fun x1 y1 z1 x2 y2 z2 ->
+    0.0  (* Placeholder - returns force magnitude *)

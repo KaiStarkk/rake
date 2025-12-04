@@ -1,0 +1,4 @@
+(library
+ (name rake_eval_lib)
+ (libraries unix yojson str)
+ (preprocess (pps ppx_deriving.show)))

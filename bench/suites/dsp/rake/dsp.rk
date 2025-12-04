@@ -1,0 +1,17 @@
+(* STUB: Digital Signal Processing in Rake *)
+(*
+   DSP is ideal for SIMD because:
+   - Streaming data with regular access patterns
+   - FIR/IIR filters are multiply-accumulate heavy
+   - FFT has predictable data shuffling
+
+   TODO:
+   - Implement FIR filter with coefficient racks
+   - Implement biquad IIR filter
+   - Add windowing functions (Hann, Hamming)
+   - Process audio blocks of 8 samples at a time
+*)
+
+rake fir_filter : float rack -> float rack -> float rack =
+  fun samples coeffs ->
+    samples  (* Placeholder *)

@@ -1,0 +1,22 @@
+(* STUB: Physics Simulation in Rake *)
+(*
+   Physics simulation tests:
+   - Rigid body dynamics
+   - Collision detection (AABB, sphere-sphere)
+   - Constraint solving
+   - Contact response
+
+   TODO:
+   - Implement AABB overlap test with rails
+   - Sphere-sphere collision with response
+   - Process 8 collision pairs in parallel
+   - Integrate positions with constraints
+*)
+
+rake aabb_overlap : float rack -> float rack -> float rack -> float rack ->
+                    float rack -> float rack -> float rack -> float rack ->
+                    float rack =
+  fun min1x min1y max1x max1y min2x min2y max2x max2y ->
+    | overlap := (max1x > min2x) * (min1x < max2x) *
+                 (max1y > min2y) * (min1y < max2y) -> 1.0
+    | otherwise -> 0.0
