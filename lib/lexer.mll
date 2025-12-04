@@ -8,7 +8,7 @@
 
   let keywords = Hashtbl.create 64
   let () = List.iter (fun (k, v) -> Hashtbl.add keywords k v) [
-    (* Data types - stack is now the definition keyword for SoA *)
+    (* Data types *)
     "stack", STACK;
     "aos", AOS;
     "single", SINGLE;

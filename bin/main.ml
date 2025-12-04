@@ -3,7 +3,8 @@
 let usage = "Usage: rakec [options] <source.rk>"
 let input_file = ref None
 let output_file = ref None
-let _dump_tokens = ref false
+
+(* Delete, never used?: let _dump_tokens = ref false *)
 let dump_ast = ref false
 let dump_types = ref false
 let target = ref "avx2"

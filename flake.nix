@@ -6,14 +6,18 @@
     flake-utils.url = "github:numtide/flake-utils";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        ocamlPackages = pkgs.ocaml-ng.ocamlPackages_4_14;
-      in {
-        devShells.default = pkgs.mkShell {
-          buildInputs = with ocamlPackages; [
+  outputs = {
+    self,
+    nixpkgs,
+    flake-utils,
+  }:
+    flake-utils.lib.eachDefaultSystem (system: let
+      pkgs = nixpkgs.legacyPackages.${system};
+      ocamlPackages = pkgs.ocamlPackages;
+    in {
+      devShells.default = pkgs.mkShell {
+        buildInputs = with ocamlPackages;
+          [
             # Core OCaml
             ocaml
             dune_3
@@ -30,7 +34,8 @@
             # Dev tools
             ocaml-lsp
             ocamlformat
-          ] ++ (with pkgs; [
+          ]
+          ++ (with pkgs; [
             # MLIR/LLVM toolchain for compilation pipeline
             llvmPackages.mlir
             llvmPackages.llvm
@@ -48,6 +53,6 @@
             # bend  # Not in nixpkgs yet
             odin
           ]);
-        };
-      });
+      };
+    });
 }
