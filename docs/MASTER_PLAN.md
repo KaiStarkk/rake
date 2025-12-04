@@ -1,565 +1,320 @@
-# Rake Language Master Plan
+# Rake: Strategic Vision
 
-## Executive Summary
+## The Core Thesis
 
-Rake is a SIMD-first programming language designed to make vectorized computation the default, not an optimization. Where C, Rust, and Zig treat SIMD as an advanced feature requiring intrinsics or hoping for auto-vectorization, Rake treats scalar operations as the special case.
+**Auto-vectorization fails on divergent code. Rails fix this.**
 
-**Core Thesis**: Most numerical code should be vectorized, but isn't, because:
-1. Auto-vectorization is fragile and unpredictable
-2. Hand-written intrinsics are unportable and unmaintainable
-3. Conditional logic breaks vectorization in traditional languages
+Every compiler vendor has spent decades on auto-vectorization. It remains fragile because the fundamental problem is unsolvable: you cannot infer vectorization intent from scalar code. When different loop iterations need different things—when there are branches—compilers give up.
 
-Rake solves these by making vectors (`rack`) the default type and providing first-class support for predicated execution (`rails`).
+Rake inverts the model. Vectors are primitive. Branches don't exist. Instead, **rails** express predicated execution: all paths compute, masks select results. This isn't an optimization; it's the semantic foundation.
 
----
-
-## 1. Current Implementation Status
-
-### 1.1 What Works Today
-
-| Component | Status | Description |
-|-----------|--------|-------------|
-| Lexer | Complete | OCamllex-based, handles all tokens |
-| Parser | Complete | Menhir LR(1), full grammar support |
-| Type Checker | Partial | Basic type inference, SoA/AoS types |
-| MLIR Emitter | Complete | Vector/Arith/Math/Func dialects |
-| MLIR → LLVM | Complete | Full lowering pipeline |
-| LLVM → Native | Complete | Via `llc` and `clang` |
-
-### 1.2 Language Features
-
-#### Implemented
-- **Rack types**: `float rack`, `int rack` - 8-wide vectors (AVX2)
-- **Scalar types**: `<name>` syntax for scalar variables
-- **Stack structs**: `stack Name = { field: type rack; ... }` (SoA layout)
-- **AoS structs**: `aos Name = { field: type; ... }`
-- **Rails**: Conditional execution with `| condition -> body`
-- **Named rails**: `| name := predicate -> body`
-- **Otherwise**: `| otherwise -> default`
-- **Functions**: `crunch` (pure) and `rake` (rails-enabled) with ML-style params
-- **Let bindings**: `let x = expr in body`
-- **Binary operators**: `+ - * / %` on vectors
-- **Comparison operators**: `< <= > >= == !=` producing masks
-- **Built-in math**: `sqrt`, `sin`, `cos`, `exp`, `log`, `abs`, `floor`, `ceil`
-- **Reductions**: `reduce(+, expr)`, `reduce(*, expr)`, etc.
-- **Results clause**: `results <| expr` for explicit return values
-
-#### Partially Implemented
-- **Pipeline operator**: `|>` parsed but not fused
-- **Field access**: `.field` on structs (type checking incomplete)
-- **Pack types**: `Name pack` for SIMD-friendly collections
-- **Iteration**: `sweep`, `spread`, `repeat` (parsing only)
-- **Compaction**: `compact` operation for removing retired lanes
-
-#### Not Yet Implemented
-- **Gather/Scatter**: Memory operations with index vectors (parsed, not codegen)
-- **Lane manipulation**: `shuffle`, `rotate`, `shift`, `compress`, `expand` (parsed)
-- **Modules**: Import/export system
-- **Generics**: Parameterized types
-- **SIMD width selection**: Currently hardcoded to 8 (AVX2)
+The language succeeds or fails on one question: **Can rails deliver consistent performance where auto-vectorization cannot?**
 
 ---
 
-## 2. Performance Strategy
+## Honest Assessment
 
-### 2.1 How to Beat Auto-Vectorization
+### What Rake Is
 
-Auto-vectorization fails in predictable ways. Rake exploits each failure mode:
+A domain-specific language for CPU SIMD computation where:
+- Data parallelism dominates
+- Control flow diverges (different elements need different treatment)
+- Performance predictability matters more than peak theoretical throughput
 
-| Auto-Vec Failure | Why It Fails | Rake Solution |
-|------------------|--------------|----------------|
-| **Conditionals** | Branches prevent vectorization | Rails → `select` (always vectorized) |
-| **Data layout** | AoS memory patterns | `stack` keyword enforces SoA |
-| **Aliasing** | Compiler can't prove non-overlap | Immutable values, explicit layout |
-| **Function calls** | Can't inline across boundaries | Aggressive inlining + fusion |
-| **Complex control** | Loops with early exit | Predicated execution throughout |
-| **Reductions** | Horizontal ops are slow | First-class reduction operations |
+### What Rake Is Not
 
-### 2.2 Target Performance Model
+- A general-purpose language (use Rust, Go, C++)
+- A GPU programming model (use CUDA, HIP, SYCL)
+- A replacement for NumPy/Julia in data science
+- A systems language for OS/driver development
 
-```
-Theoretical Peak (AVX2): 8 × clock × cores FLOPs
-Auto-vectorized C:       ~30-60% of peak (varies wildly)
-Hand-tuned intrinsics:   ~70-90% of peak
-Rake target:            ~70-85% of peak (consistent)
-```
+### The Niche
 
-The key insight: **consistency beats occasional peaks**. Rake code should always vectorize, while C/Rust code vectorizes only when stars align.
+Rake targets the **10-20% of code that consumes 80-90% of cycles** in compute-bound applications—specifically, code where auto-vectorization fails due to conditional logic:
 
-### 2.3 Current Benchmark Results
+| Domain | Why Rails Win |
+|--------|---------------|
+| Ray tracing | Rays hit different objects; BVH traversal branches unpredictably |
+| Particle systems | Boundary conditions, life/death, collision responses |
+| Game physics | Constraint solving with conditional contact points |
+| Audio DSP | Voice stealing, filter mode switching, envelope stages |
+| ML inference | Activation functions with branches, attention masking |
 
-```
-1M particles, 100 iterations:
-  Rake (MLIR→LLVM):     453.7 M particles/sec
-  C (auto-vectorized):   475.8 M particles/sec
-  Gap:                   ~5% slower
-```
+### Competitive Position
 
-**Why the gap exists**:
-1. Function call overhead (each Rake op is a separate function)
-2. No fusion of pipeline operations
-3. No link-time optimization
+| Language | Approach | Rake's Edge |
+|----------|----------|-------------|
+| **ISPC** | Implicit vectorization, `uniform`/`varying` | Complete language (not kernel-only), cleaner rail syntax |
+| **Rust std::simd** | Explicit SIMD types, manual predication | First-class rails, less boilerplate |
+| **Zig @Vector** | Built-in vector types | Higher-level abstraction for divergent code |
+| **C intrinsics** | Manual everything | Readable, portable, maintainable |
 
-**How we close it** (see Section 4: Roadmap):
-1. Pipeline fusion eliminates intermediate values
-2. Whole-program compilation enables inlining
-3. LTO across Rake/C boundaries
-
-### 2.4 Path to Performance Leadership
-
-The 5% gap represents function call overhead and lack of fusion. Closing this gap—and then exceeding C—requires three phases:
-
-#### Phase A: Eliminate Overhead (Target: Parity)
-
-1. **Pipeline Fusion**: Transform `a |> f |> g |> h` into a single fused loop
-   - Currently: Each `|>` produces intermediate vector, each function is a call
-   - Target: Single loop body with inlined operations, no intermediates
-   - Implementation: MLIR Transform dialect patterns for `|>` sequences
-   - Expected gain: 15-25%
-
-2. **Function Inlining**: Inline all `crunch` functions at call sites
-   - Currently: Each function is emitted separately, called via LLVM
-   - Target: Aggressive inlining controlled by size heuristics
-   - Implementation: MLIR inliner pass with Rake-specific cost model
-   - Expected gain: 5-15%
-
-3. **Register Allocation Hints**: Help LLVM keep vectors in registers
-   - Currently: LLVM decides register allocation without context
-   - Target: Emit LLVM metadata suggesting register pressure
-   - Implementation: Custom MLIR-to-LLVM lowering attributes
-   - Expected gain: 5-10%
-
-#### Phase B: Exploit Language Guarantees (Target: 20% Lead)
-
-Auto-vectorizers work with limited information. Rake has **guaranteed** properties:
-
-1. **No Aliasing**: All Rake values are immutable
-   - C compilers must assume pointers may alias
-   - Rake can always parallelize without checks
-   - Implementation: Emit `noalias` on all pointers, use value semantics
-
-2. **Predictable Memory Layout**: `stack` enforces structure-of-arrays
-   - C compilers analyze layout; may give up on complex types
-   - Rake knows at compile time: all fields are contiguous
-   - Implementation: Generate optimal gather patterns statically
-
-3. **Rails Are Masks**: Branch-free predicated execution
-   - C compilers: branch prediction + speculative execution
-   - Rake: always evaluate both paths, mask-select result
-   - For divergent workloads (ray tracing), this is 2-3x faster
-
-4. **Whole-Program View**: See all code at compile time
-   - C compilers: limited to translation units or LTO
-   - Rake: can analyze entire program's data flow
-   - Enables global optimization decisions
-
-#### Phase C: Advanced Optimizations (Target: Match Hand-Tuned)
-
-1. **Rail Merging**: Combine overlapping predicates
-   ```rake
-   (* Before optimization *)         (* After optimization *)
-   | x > 0 -> f(x)                   | x > 0 and x < 1 -> g(x)
-   | x < 1 -> g(x)          →        | x >= 1 -> f(x)
-   | otherwise -> h(x)               | otherwise -> h(x)
-   ```
-   Reduces mask operations by detecting overlap at compile time.
-
-2. **SIMD Width Selection**: Choose optimal vector width per function
-   - AVX-512 for large data sets
-   - AVX2 for mixed workloads (less frequency throttling)
-   - SSE for memory-bound operations
-   - Implementation: Cost model based on operation mix
-
-3. **Automatic Blocking**: Tile loops for cache hierarchy
-   - L1: 32KB → 4K floats per block
-   - L2: 256KB → 32K floats per block
-   - L3: 8MB+ → buffer entire working set
-   - Implementation: Affine dialect + tiling transform
-
-4. **Memory Prefetching**: Predict access patterns from SoA layout
-   - Rake knows field access patterns statically
-   - Emit prefetch hints for predictable streams
-   - Implementation: Custom lowering pass
-
-### 2.5 Performance Leadership Timeline
-
-```
-Week 1-2:  Pipeline fusion prototype (basic |> chains)
-Week 3-4:  Function inlining infrastructure
-Week 5-6:  Ray tracer demo implementation
-Week 7-8:  Benchmark + optimize ray tracer to beat C
-Month 3:   Rail merging optimization
-Month 4:   SIMD width selection
-Month 5:   Affine tiling integration
-Month 6:   GPU targeting proof-of-concept
-```
+ISPC is the closest competitor. Rake differentiates through:
+1. ML-inspired syntax (rails as pattern matching)
+2. Complete language (no C++ host required)
+3. MLIR backend (leverage existing optimization infrastructure)
 
 ---
 
-## 3. Killer Demo Analysis
+## Current State
 
-### 3.1 Candidate Applications
+### What Works
 
-| Application | Auto-Vec Difficulty | Rake Advantage | Demo Potential |
-|-------------|--------------------|-----------------| ---------------|
-| **Mandelbrot** | Medium | Rails for divergence | High (visual) |
-| **Particles** | Medium | SoA + rails for bounds | High (visual) |
-| **Audio DSP** | Low | Consistent perf | Medium |
-| **Image filters** | Low-Medium | Rails for edge cases | High (visual) |
-| **Ray tracing** | High | Rails for hit/miss | Very High |
-| **N-body** | High | SoA + complex conditions | Very High |
-| **Neural net inference** | Medium | Matrix ops + activation | High |
-| **Physics simulation** | High | Constraint solving | Very High |
+| Component | Status | Quality |
+|-----------|--------|---------|
+| Lexer | Complete | Production |
+| Parser | Complete | Production |
+| Type checker | Partial | Functional |
+| MLIR emitter | Complete | Functional |
+| LLVM lowering | Complete | Functional |
+| Native codegen | Complete | Functional |
 
-### 3.2 Recommended Killer Demo: Ray Tracing
+### Performance Gap
 
-**Why ray tracing is ideal**:
+```
+Benchmark: 1M particles, 100 iterations
+─────────────────────────────────────────
+Rake (MLIR→LLVM):     453.7 M particles/sec
+C (auto-vectorized):  475.8 M particles/sec
+─────────────────────────────────────────
+Gap:                  ~5% slower
+```
 
-1. **Divergent execution**: Each ray may hit different objects, creating branches that kill auto-vectorization. Rake rails handle this naturally.
+**This gap is unacceptable.** Nobody adopts a new language to be slower.
 
-2. **Visual impact**: Results are immediately compelling and shareable.
+### Gap Analysis
 
-3. **Well-understood benchmark**: Compare against existing implementations.
+The 5% comes from:
 
-4. **Multiple rail conditions**:
-   ```rake
-   rake trace_ray ray =
-     | hit_sphere := intersect_sphere(ray) -> shade_sphere(ray)
-     | hit_plane := intersect_plane(ray) -> shade_plane(ray)
-     | hit_box := intersect_box(ray) -> shade_box(ray)
-     | otherwise -> background_color
-   ```
+1. **Function call overhead** (3-4%): Each `crunch`/`rake` emits as a separate function. LLVM doesn't inline across the MLIR boundary without LTO.
 
-5. **SoA benefits**: Rays, hits, and colors all benefit from SoA layout.
+2. **No pipeline fusion** (1-2%): `a |> f |> g |> h` creates intermediate values instead of fusing into one operation.
 
-### 3.3 Secondary Demos
-
-1. **Mandelbrot zoom**: Shows rails handling iteration divergence
-2. **Particle collision**: Shows SoA layout + boundary rails
-3. **Audio synthesis**: Shows consistent real-time performance
+3. **Conservative MLIR lowering**: Default passes don't exploit Rake's semantic guarantees (no aliasing, known layouts).
 
 ---
 
-## 4. Development Roadmap
+## The Path Forward
 
-### Phase 1: Performance Parity (Current)
-- [x] MLIR emission
-- [x] LLVM lowering
-- [x] Native compilation
-- [x] Basic benchmarking
-- [ ] Pipeline fusion
-- [ ] Function inlining
+### Phase 1: Prove the Concept
 
-### Phase 2: Performance Leadership
-- [ ] Whole-program optimization
-- [ ] Cross-module inlining
-- [ ] SIMD width selection (AVX-512, NEON)
-- [ ] Gather/scatter operations
-- [ ] Advanced rail optimization
+**Objective**: Demonstrate that rails beat auto-vectorization on divergent workloads.
 
-### Phase 3: Ecosystem
-- [ ] Module system
-- [ ] Package manager
-- [ ] IDE support (LSP)
-- [ ] Debugging support
-- [ ] Profiling integration
+**Deliverables**:
+1. Close the 5% gap (pipeline fusion + inlining)
+2. Implement ray tracer demo
+3. Beat C by 20%+ on ray tracing
 
-### Phase 4: Production Ready
-- [ ] Comprehensive test suite
-- [ ] Formal specification
-- [ ] Multiple backend targets
-- [ ] Stable ABI
-- [ ] Documentation
+**Why Ray Tracing**: It's the perfect showcase because:
+- Every ray diverges (hits different objects)
+- BVH traversal has unpredictable branches
+- Auto-vectorizers fail catastrophically here
+- Visual output is immediately compelling
+- Well-understood benchmark for comparison
 
----
+**Technical Work**:
 
-## 5. MLIR Optimization Roadmap
+| Task | Impact | Complexity |
+|------|--------|------------|
+| Pipeline fusion (`\|>` chains) | 20-40% on hot paths | Medium |
+| Function inlining (crunch → inline) | 5-15% | Low |
+| Vec3 operations (dot, cross, normalize) | Enables ray tracer | Low |
+| Ray-sphere/plane/box intersection | Core demo | Medium |
+| BVH traversal with rail-based selection | Killer demo | High |
 
-The key to performance leadership lies in leveraging MLIR's dialect system. We currently use basic dialects; the path forward involves progressively adopting higher-level dialects that enable more aggressive optimization.
+### Phase 2: Make It Usable
 
-### 5.1 Current Dialect Usage
+**Objective**: A developer can write real code without constant friction.
 
-| Dialect | Usage | Performance Impact |
-|---------|-------|-------------------|
-| `func` | Function definitions | Baseline |
-| `arith` | Arithmetic operations | Baseline |
-| `vector` | SIMD operations | **Core value** |
-| `math` | Transcendentals | Baseline |
-| `llvm` | Lowering target | Baseline |
+**Deliverables**:
+1. Standard library (vec3, mat4, common math)
+2. Useful error messages with source locations
+3. Basic module system (import/export)
+4. C FFI (embed Rake in existing projects)
 
-### 5.2 Near-Term Dialect Adoption
+**Technical Work**:
 
-**SCF (Structured Control Flow)** — Priority: High
-- Replace direct loop lowering with `scf.for`, `scf.while`
-- Enables loop-invariant code motion
-- Enables loop fusion across pipeline stages
-- Maps directly to our `sweep` construct
+| Task | Impact | Complexity |
+|------|--------|------------|
+| Vec module (dot, cross, length, normalize) | High | Low |
+| Mat module (mul, transform, inverse) | Medium | Medium |
+| Error recovery in parser | Medium | Medium |
+| Source location tracking | High | Low |
+| Module system design | High | High |
+| C calling convention | High | Medium |
 
-**Transform Dialect** — Priority: High
-- Define Rake-specific optimization patterns
-- Fusion rules for pipeline operator
-- Rail merging when predicates overlap
-- Custom tiling strategies for SIMD
+### Phase 3: Make It Adoptable
 
-### 5.3 Medium-Term Dialect Adoption
+**Objective**: External developers can evaluate and adopt Rake.
 
-**Affine Dialect** — Priority: Medium
-- Polyhedral analysis for nested loops
-- Automatic cache-aware tiling
-- Memory access pattern optimization
-- Enables auto-parallelization
+**Deliverables**:
+1. Multiple SIMD targets (AVX-512, NEON)
+2. LSP for IDE support
+3. Documentation that doesn't require reading source
+4. Benchmark suite with reproducible results
 
-**Linalg Dialect** — Priority: Medium
-- High-level matrix operation representation
-- Automatic fusion of matrix chains
-- Tiling for register blocking
-- Path to GPU offload
+**Technical Work**:
 
-### 5.4 Future Dialect Adoption
-
-**GPU Dialect** — Priority: Future
-- Same Rake source → GPU compute shaders
-- CUDA/ROCm/Vulkan backends via SPIRV
-- Automatic host/device partitioning
-
-**Bufferization** — Priority: Future
-- Minimize memory allocations
-- In-place operation conversion
-- Alias analysis for optimization
-
-### 5.5 Performance Unlocks by Dialect
-
-```
-Dialect         Optimization                    Expected Gain
-─────────────────────────────────────────────────────────────
-SCF             Loop fusion                     10-30%
-Transform       Pipeline operator fusion        20-40%
-Affine          Cache-aware tiling              15-25%
-Linalg          Matrix operation fusion         30-50%
-GPU             Parallel execution              10-100x
-```
+| Task | Impact | Complexity |
+|------|--------|------------|
+| AVX-512 backend (16-wide) | Medium | Low |
+| NEON backend (ARM) | Medium | Medium |
+| LSP server | High | High |
+| Tutorial documentation | High | Medium |
+| Automated benchmark CI | Medium | Low |
 
 ---
 
-## 6. Pipeline Architecture
+## MLIR Strategy
 
-### 6.1 Current Pipeline
+The decision to target MLIR instead of emitting LLVM directly is correct. MLIR provides:
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        RAKE COMPILER                            │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │  Source  │───▶│  Lexer   │───▶│  Parser  │───▶│   AST    │  │
-│  │ .rake   │    │(ocamllex)│    │ (Menhir) │    │          │  │
-│  └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
-│                                                       │        │
-│                        RAKE (OCaml)                   │        │
-├───────────────────────────────────────────────────────┼────────┤
-│                                                       ▼        │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │   Type   │◀───│   AST    │    │   MLIR   │◀───│  MLIR    │  │
-│  │  Check   │    │          │───▶│  Emitter │    │ (textual)│  │
-│  └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
-│                                                       │        │
-│                        RAKE (OCaml)                   │        │
-├───────────────────────────────────────────────────────┼────────┤
-│                                                       ▼        │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │ mlir-opt │───▶│  LLVM    │───▶│mlir-trans│───▶│  LLVM IR │  │
-│  │ (passes) │    │ Dialect  │    │  -late   │    │   .ll    │  │
-│  └──────────┘    └──────────┘    └──────────┘    └────┬─────┘  │
-│                                                       │        │
-│                        MLIR TOOLS                     │        │
-├───────────────────────────────────────────────────────┼────────┤
-│                                                       ▼        │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
-│  │   llc    │───▶│  Object  │───▶│  clang   │───▶│  Binary  │  │
-│  │          │    │   .o     │    │ (link)   │    │          │  │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
-│                                                                 │
-│                        LLVM TOOLS                               │
-└─────────────────────────────────────────────────────────────────┘
-```
+1. **Vector dialect**: First-class SIMD operations
+2. **Transform dialect**: Pattern-based optimization
+3. **Affine dialect**: Polyhedral loop optimization
+4. **Multiple backends**: CPU, GPU, TPU paths
 
-### 6.2 Component Ownership
-
-| Stage | Tool | We Control | They Control |
-|-------|------|------------|--------------|
-| Lexing | ocamllex | Token definitions | Regex engine |
-| Parsing | Menhir | Grammar, AST shape | Parse algorithm |
-| Type check | Custom | Everything | - |
-| MLIR gen | Custom | IR structure | - |
-| MLIR opt | mlir-opt | Pass selection | Pass implementation |
-| LLVM gen | mlir-translate | - | Translation |
-| Codegen | llc | Flags only | Everything |
-| Linking | clang | Flags only | Everything |
-
-### 6.3 Optimization Opportunities by Stage
+### Current Dialect Usage
 
 ```
-Stage           Current         Potential       Difficulty
-─────────────────────────────────────────────────────────
-Parsing         None            Incremental     Low
-Type Check      Basic           Full inference  Medium
-MLIR Gen        Direct emit     Optimize first  Medium
-MLIR Opt        Basic passes    Custom passes   High
-LLVM            Default         LTO, PGO        Low
+Rake source
+    ↓
+func + arith + vector + math (current)
+    ↓
+llvm dialect
+    ↓
+LLVM IR → native
 ```
+
+### Target Dialect Stack
+
+```
+Rake source
+    ↓
+scf + vector + arith + math (structured control flow)
+    ↓ [loop fusion, tiling]
+vector + arith
+    ↓ [lowering]
+llvm dialect
+    ↓
+LLVM IR → native
+```
+
+### Key Optimizations by Dialect
+
+| Dialect | Optimization | Expected Gain |
+|---------|--------------|---------------|
+| SCF | Loop fusion across `sweep` | 10-30% |
+| Transform | Pipeline operator fusion | 20-40% |
+| Affine | Cache-aware tiling | 15-25% |
+| Vector | Mask simplification | 5-10% |
 
 ---
 
-## 7. Feature Coverage Matrix
+## Language Guarantees That Enable Optimization
 
-### 7.1 MLIR Feature Utilization
+Rake code has properties that C/Rust cannot guarantee:
 
-| MLIR Capability | Current Use | Potential | Priority |
-|-----------------|-------------|-----------|----------|
-| Vector dialect ops | 60% | 95% | High |
-| Math dialect | 80% | 95% | Medium |
-| Arith dialect | 90% | 100% | Low |
-| Func dialect | 100% | 100% | - |
-| SCF dialect | 0% | 80% | High |
-| Affine dialect | 0% | 70% | Medium |
-| Linalg dialect | 0% | 60% | Low |
-| GPU dialect | 0% | 90% | Future |
-| Transform dialect | 0% | 50% | Medium |
-| Pass pipeline | Basic | Custom | High |
+1. **No aliasing**: All values are semantically immutable within `rake`/`crunch`. The compiler can always parallelize without alias checks.
 
-### 7.2 Rake Language Coverage
+2. **Known memory layout**: `stack` enforces SoA. The compiler knows at compile time that all x-components are contiguous.
 
-| Language Feature | Spec | Impl | Tests | Docs |
-|------------------|------|------|-------|------|
-| Rack types | 100% | 100% | 50% | 20% |
-| Scalar types | 100% | 80% | 30% | 10% |
-| SoA structs | 100% | 90% | 40% | 20% |
-| AoS structs | 100% | 90% | 20% | 10% |
-| Rails | 100% | 95% | 60% | 30% |
-| Functions | 100% | 95% | 50% | 30% |
-| Pipeline op | 80% | 30% | 10% | 10% |
-| Reductions | 100% | 80% | 30% | 20% |
-| Iteration | 60% | 20% | 0% | 0% |
-| Modules | 20% | 0% | 0% | 0% |
+3. **Predication, not branching**: Rails guarantee all paths execute. No branch misprediction, no speculation.
+
+4. **Whole-program visibility**: No separate compilation (initially). The compiler sees everything.
+
+These enable optimizations that are unsafe or impossible in C:
+- Aggressive reordering without alias analysis
+- Static gather pattern generation
+- Cross-function fusion without interprocedural analysis
 
 ---
 
-## 8. Risk Analysis
+## Risk Assessment
 
-### 8.1 Technical Risks
+### Technical Risks
 
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
-| MLIR breaking changes | Low | High | Pin LLVM version |
-| Performance ceiling | Medium | High | Custom MLIR passes |
-| Complex type system | Medium | Medium | Incremental design |
-| Memory management | High | Medium | Design carefully |
+| Performance ceiling (can't beat C) | Medium | Fatal | Focus on divergent workloads where C fails |
+| MLIR breaking changes | Low | High | Pin LLVM version, abstract emission layer |
+| Complexity explosion in type system | Medium | Medium | Keep types simple; defer generics |
 
-### 8.2 Adoption Risks
+### Adoption Risks
 
 | Risk | Probability | Impact | Mitigation |
 |------|-------------|--------|------------|
-| No killer demo | Medium | High | Focus on ray tracer |
-| Learning curve | High | Medium | Good docs, familiar syntax |
-| Limited ecosystem | High | Medium | C FFI, gradual adoption |
-| Competition | Low | Low | Unique positioning |
+| No killer demo | High | Fatal | Ray tracer is existential priority |
+| Learning curve too steep | Medium | High | Familiar ML syntax; good docs |
+| No ecosystem | High | Medium | C FFI for gradual adoption |
 
 ---
 
-## 9. Success Metrics
+## Success Criteria
 
-### 9.1 Performance Milestones
+### Phase 1 Success (Proof of Concept)
 
-1. **Parity** (Current): Match auto-vectorized C
-2. **Lead**: 20% faster than auto-vectorized C on rail-heavy code
-3. **Dominance**: Match hand-tuned intrinsics on target demos
+- [ ] Ray tracer compiles and runs
+- [ ] Ray tracer beats auto-vectorized C by 20%+
+- [ ] Performance gap on particles benchmark < 2%
 
-### 9.2 Language Milestones
+### Phase 2 Success (Usable)
 
-1. **Bootstrap**: Compile particles.rake to working binary ✓
-2. **Demo**: Ray tracer that beats C implementation
-3. **Usable**: Module system, error messages, debugging
-4. **Production**: Stable ABI, package ecosystem
+- [ ] 3 non-trivial programs written by non-authors
+- [ ] Error messages point to correct source locations
+- [ ] C FFI works for embedding Rake functions
 
-### 9.3 Adoption Milestones
+### Phase 3 Success (Adoptable)
 
-1. **Interest**: Conference talk / blog post attention
-2. **Trial**: External contributors try Rake
-3. **Use**: Real project uses Rake for hot path
-4. **Recommend**: Users advocate for Rake
+- [ ] Someone outside the project writes a blog post
+- [ ] Conference talk or paper accepted
+- [ ] One production use case (even if small)
 
 ---
 
-## 10. Conclusion
+## What We're Not Doing
 
-Rake occupies a unique position: a language where SIMD is the default, not an optimization. The path to success requires:
+Explicit non-goals to maintain focus:
 
-1. **Demonstrating clear wins** on problems where auto-vectorization fails
-2. **Minimizing friction** through familiar syntax and good tooling
-3. **Leveraging existing infrastructure** (MLIR, LLVM) rather than reinventing
-
-The immediate priorities are:
-1. **Pipeline fusion** to close the performance gap
-2. **Ray tracer demo** to prove the concept
-3. **Polish** to make the language pleasant to use
-
-The MLIR bet is correct - it provides the optimization infrastructure we need while allowing us to focus on language design. A custom backend would be a distraction with no clear benefit.
+1. **GPU targeting** — CPU SIMD is hard enough. GPU comes later (if ever).
+2. **Generics** — Monomorphic code is simpler. Add generics when there's pain.
+3. **Formal verification** — Interesting but not the bottleneck.
+4. **Distributed execution** — Out of scope entirely.
+5. **IDE plugins** — LSP first; editor-specific plugins never.
+6. **Package manager** — Premature. Single-file programs are fine for now.
 
 ---
 
-## Appendix A: File Structure
+## The Vocabulary Is the Product
 
-```
-rake/
-├── lib/                    # Compiler library
-│   ├── ast.ml             # AST definition
-│   ├── lexer.mll          # Lexer specification
-│   ├── parser.mly         # Parser grammar
-│   ├── types.ml           # Type definitions
-│   ├── check.ml           # Type checker
-│   ├── mlir.ml            # MLIR emitter
-│   └── emit.ml            # Legacy LLVM emitter
-├── bin/
-│   └── main.ml            # Compiler driver
-├── examples/
-│   ├── particles.rake    # Main example
-│   ├── particles.c        # C comparison
-│   ├── particles_rust/    # Rust comparison
-│   ├── compile.sh         # Compilation script
-│   ├── benchmark.sh       # Benchmark script
-│   └── build/             # Build artifacts
-├── docs/
-│   └── MASTER_PLAN.md     # This document
-└── dune-project           # Build configuration
-```
+The terms `rake`, `rail`, `rack`, `sweep`, `spread`, `crunch`, `retire`, `compact` aren't whimsy. They're cognitive tools that reinforce the parallel mental model.
 
-## Appendix B: Dialect Migration Path
+Traditional keywords carry scalar baggage:
+- `if` implies one path executes
+- `for` implies sequential iteration
+- `array` implies indexed access
 
-```
-Current:    Rake → vector/arith/math/func → llvm → native
+Rake's vocabulary forces parallel thinking:
+- `rail` implies all paths execute, masks select
+- `sweep` implies parallel processing of chunks
+- `rack` implies SIMD register, not array
 
-Phase 2:    Rake → scf/vector/arith → vector/arith → llvm → native
-                    (structured loops)  (loop opts)
-
-Phase 3:    Rake → affine/linalg → scf/vector → llvm → native
-                    (high-level)    (tiling)
-
-Future:     Rake → linalg → gpu/spirv → GPU binary
-                           ↘ llvm → CPU binary
-```
-
-## Appendix C: Comparison with Alternatives
-
-| Language | SIMD Approach | Pros | Cons |
-|----------|---------------|------|------|
-| C | Intrinsics or auto-vec | Universal, fast | Fragile, unportable |
-| Rust | std::simd (nightly) | Safe, explicit | Verbose, unstable |
-| Zig | @Vector built-in | Simple, explicit | Manual, no rails |
-| ISPC | Implicit vectorization | Automatic, proven | Separate language |
-| **Rake** | Default vectors + rails | Consistent, elegant | New, unproven |
+This vocabulary IS the product. A Rake programmer thinks differently than a C programmer, and the language enforces this through every keyword.
 
 ---
 
-*Document version: 2.0*
-*Last updated: December 2024*
-*Focus: Performance Leadership via MLIR dialect adoption*
+## Conclusion
+
+Rake exists because **divergent control flow kills auto-vectorization**, and rails are the answer.
+
+The path to success:
+1. **Prove it works**: Ray tracer that beats C
+2. **Make it usable**: Vec3/mat4, error messages, modules
+3. **Make it adoptable**: Multiple targets, LSP, docs
+
+Everything else is distraction.
+
+---
+
+*Version 3.0 — December 2024*
+*Focus: Existential proof via ray tracer demo*
