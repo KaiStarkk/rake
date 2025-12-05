@@ -1,0 +1,96 @@
+Rake 0.2.0 Implementation Progress
+==================================
+
+COMPLETED
+---------
+
+1. Core Language Features
+   - Parser with tine/through/sweep syntax
+   - Type checker for racks, stacks, packs, singles
+   - MLIR emitter for vector dialect
+
+2. Over Loop Implementation
+   - Added `over pack, count |> chunk: body` syntax
+   - Pack parameters expand to memref<?xf32> parameters
+   - Field access on chunk variables loads from pack memrefs
+   - Tail masking via vector.create_mask
+   - Masked stores to output memref
+
+3. Standalone Raytracer
+   - Ray-sphere intersection with divergent control flow
+   - Tine-based lane partitioning (#miss, #maybe)
+   - Through blocks for conditional computation
+   - Sweep block for result collection
+   - Generates valid MLIR that compiles to working AVX2 code
+   - Test harness validates correct ray-sphere intersection
+
+4. Build Pipeline (scripts/build_rake.sh)
+   .rk → MLIR → LLVM dialect → LLVM IR → Object file
+
+   Pipeline:
+   - Rake parser and type checker
+   - MLIR vector dialect emission
+   - convert-vector-to-scf
+   - convert-scf-to-cf
+   - convert-vector-to-llvm
+   - convert-math-to-llvm
+   - convert-arith-to-llvm
+   - convert-index-to-llvm
+   - convert-func-to-llvm
+   - convert-cf-to-llvm
+   - finalize-memref-to-llvm
+   - reconcile-unrealized-casts
+   - mlir-translate --mlir-to-llvmir
+   - llc with -mattr=+avx2
+
+GPU BACKEND EXPLORATION
+-----------------------
+
+Path to Vulkan/SPIR-V:
+
+1. GPU Dialect
+   - Use gpu.launch blocks/threads syntax
+   - gpu.module for kernel code
+   - gpu.func for kernel functions
+   - Requires spirv.entry_point_abi attribute
+
+2. SPIR-V Conversion
+   - --convert-gpu-to-spirv converts GPU dialect
+   - --spirv-lower-abi-attrs lowers ABI
+   - --spirv-update-vce updates version/caps/exts
+
+3. Example SPIR-V kernel structure:
+   spirv.module @kernels Logical GLSL450 {
+     spirv.GlobalVariable @__builtin__WorkgroupId__
+     spirv.GlobalVariable @__builtin__LocalInvocationId__
+     spirv.GlobalVariable @kernel_arg_0 bind(0, 0)
+
+     spirv.func @kernel() "None" {
+       // Load block/thread IDs
+       // Compute global index
+       // Access storage buffers
+       spirv.Return
+     }
+
+     spirv.EntryPoint "GLCompute" @kernel, ...
+     spirv.ExecutionMode @kernel "LocalSize", 128, 1, 1
+   }
+
+NEXT STEPS
+----------
+
+1. GPU Backend for Rake
+   - Add --target=gpu flag
+   - Generate gpu.launch instead of scf.for
+   - Map over loop to thread parallelism
+   - Add spirv.entry_point_abi automatically
+
+2. Vulkan Rendering
+   - Create Vulkan compute shader from SPIR-V
+   - Implement buffer management for ray data
+   - Real-time visualization of raytracing
+
+3. Optimization
+   - Lane-level parallelism within GPU subgroups
+   - Coalesced memory access patterns
+   - Shared memory for local communication
