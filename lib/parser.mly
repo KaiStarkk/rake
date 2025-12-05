@@ -454,6 +454,42 @@ stmt_list:
 stmt:
   | LET b = binding { mk_node (SLet b) $startpos $endpos }
   | name = IDENT ASSIGN e = expr { mk_node (SAssign (name, e)) $startpos $endpos }
+  | o = over_stmt { o }
+  | e = expr { mk_node (SExpr e) $startpos $endpos }
+
+(* ═══════════════════════════════════════════════════════════════════ *)
+(* Over loop: iterate over pack in stack-sized chunks                  *)
+(*                                                                      *)
+(*   over rays, count |> ray:                                           *)
+(*     let t = intersect(ray.ox, ray.oy, ...)                           *)
+(*     result[offset] <- t                                              *)
+(*                                                                      *)
+(* Each iteration processes one stack (lanes elements).                 *)
+(* Tail iteration is automatically masked for count % lanes != 0.       *)
+(* ═══════════════════════════════════════════════════════════════════ *)
+
+over_stmt:
+  | OVER pack = IDENT COMMA count = over_count_expr PIPE chunk = IDENT COLON
+    body = over_body {
+      mk_node (SOver {
+        over_pack = pack;
+        over_count = count;
+        over_chunk = chunk;
+        over_body = body;
+      }) $startpos $endpos
+    }
+
+over_count_expr:
+  | name = IDENT { mk_node (EVar name) $startpos $endpos }
+  | name = SCALAR_IDENT { mk_node (EScalarVar name) $startpos $endpos }
+  | n = INT_LIT { mk_node (EInt n) $startpos $endpos }
+
+over_body:
+  | ss = nonempty_list(over_body_stmt) { ss }
+
+over_body_stmt:
+  | LET b = binding { mk_node (SLet b) $startpos $endpos }
+  | name = IDENT ASSIGN e = expr { mk_node (SAssign (name, e)) $startpos $endpos }
   | e = expr { mk_node (SExpr e) $startpos $endpos }
 
 binding:

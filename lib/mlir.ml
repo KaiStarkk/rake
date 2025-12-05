@@ -341,7 +341,7 @@ and get_field_type t field =
   | _ -> Rack SFloat
 
 (** Emit a statement *)
-let emit_stmt ctx (stmt: Ast.stmt) =
+let rec emit_stmt ctx (stmt: Ast.stmt) =
   match stmt.v with
   | SLet binding ->
       let (v, t) = emit_expr ctx binding.bind_expr in
@@ -354,6 +354,69 @@ let emit_stmt ctx (stmt: Ast.stmt) =
 
   | SExpr e ->
       ignore (emit_expr ctx e)
+
+  | SOver over ->
+      (* Emit scf.for loop over pack in stack-sized chunks *)
+      emit_over_loop ctx over
+
+(** Emit over loop: scf.for iterating over pack in chunks of lanes *)
+and emit_over_loop ctx (over: Ast.over_loop) =
+  (* Get count expression *)
+  let (count_val, _) = emit_expr ctx over.over_count in
+
+  (* Constants for loop bounds *)
+  let zero = fresh ctx "zero" in
+  let one = fresh ctx "one" in
+  let lanes_val = fresh ctx "lanes" in
+  let num_iters = fresh ctx "niters" in
+
+  emit ctx "%s = arith.constant 0 : index" zero;
+  emit ctx "%s = arith.constant 1 : index" one;
+  emit ctx "%s = arith.constant %d : index" lanes_val vector_width;
+
+  (* Cast count to index if needed *)
+  let count_idx = fresh ctx "count_idx" in
+  emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_val;
+
+  (* Compute number of full iterations: ceil(count / lanes) *)
+  let count_plus = fresh ctx "count_plus" in
+  let lanes_minus_one = fresh ctx "lanes_m1" in
+  emit ctx "%s = arith.constant %d : index" lanes_minus_one (vector_width - 1);
+  emit ctx "%s = arith.addi %s, %s : index" count_plus count_idx lanes_minus_one;
+  emit ctx "%s = arith.divui %s, %s : index" num_iters count_plus lanes_val;
+
+  (* Emit scf.for loop *)
+  let iter_var = fresh ctx "i" in
+  emit ctx "scf.for %s = %s to %s step %s {" iter_var zero num_iters one;
+  ctx.indent <- ctx.indent + 1;
+
+  (* Compute offset for this iteration *)
+  let offset = fresh ctx "offset" in
+  emit ctx "%s = arith.muli %s, %s : index" offset iter_var lanes_val;
+
+  (* Compute tail mask for last iteration *)
+  let remaining = fresh ctx "remaining" in
+  let is_tail = fresh ctx "is_tail" in
+  let mask = fresh ctx "mask" in
+  let mask_remaining = fresh ctx "mask_rem" in
+  let all_true = fresh ctx "all_true" in
+
+  emit ctx "%s = arith.subi %s, %s : index" remaining count_idx offset;
+  emit ctx "%s = arith.cmpi ult, %s, %s : index" is_tail remaining lanes_val;
+  emit ctx "%s = arith.index_cast %s : index to i32" mask_remaining remaining;
+  emit ctx "%s = arith.constant dense<true> : %s" all_true vec_i1;
+  emit ctx "%s = vector.create_mask %s : %s" mask mask_remaining vec_i1;
+
+  (* TODO: Load chunk from pack at offset, bind to over.over_chunk *)
+  (* For now, emit a placeholder comment *)
+  emit ctx "// Load chunk '%s' from pack '%s' at offset %%offset" over.over_chunk over.over_pack;
+  emit ctx "// Tail mask available in %s for masked operations" mask;
+
+  (* Emit body statements *)
+  List.iter (emit_stmt ctx) over.over_body;
+
+  ctx.indent <- ctx.indent - 1;
+  emit ctx "}"
 
 (** Emit predicate, return SSA name of mask *)
 let rec emit_predicate ctx (pred: Ast.predicate) : string =

@@ -57,8 +57,9 @@ let rec typ_to_t env (ty: typ) : t =
       | None -> type_errorf ty.loc "Unknown stack type: %s" name)
   | TPack name -> (
       match Hashtbl.find_opt env.types name with
-      | Some t -> t
-      | None -> type_errorf ty.loc "Unknown pack type: %s" name)
+      | Some (Stack (n, fields)) -> Pack (n, fields)  (* Convert stack to pack *)
+      | Some t -> type_errorf ty.loc "Expected stack type for pack, got %s" (show_concise t)
+      | None -> type_errorf ty.loc "Unknown type for pack: %s" name)
   | TSingle name -> (
       match Hashtbl.find_opt env.types name with
       | Some t -> t
@@ -300,7 +301,7 @@ and infer_unop t op _loc =
   | Not -> Mask
 
 (** Check a statement, return updated env *)
-let check_stmt env (stmt: stmt) : env =
+let rec check_stmt env (stmt: stmt) : env =
   match stmt.v with
   | SLet binding ->
       let t = infer_expr env binding.bind_expr in
@@ -321,6 +322,25 @@ let check_stmt env (stmt: stmt) : env =
       env
   | SExpr e ->
       let _ = infer_expr env e in
+      env
+  | SOver over ->
+      (* Check the count expression *)
+      let _count_t = infer_expr env over.over_count in
+      (* Look up pack type and derive stack type for chunk binding *)
+      let pack_t = match Hashtbl.find_opt env.vars over.over_pack with
+        | Some (Pack (name, fields)) -> Pack (name, fields)
+        | Some t -> type_errorf stmt.loc "Expected pack type, got %s" (show_concise t)
+        | None -> type_errorf stmt.loc "Undefined pack: %s" over.over_pack
+      in
+      (* The chunk binding gets the corresponding stack type *)
+      let chunk_t = match pack_t with
+        | Pack (name, fields) -> Stack (name, fields)
+        | _ -> type_errorf stmt.loc "Expected pack type"
+      in
+      (* Add chunk to env and check body *)
+      let body_env = { env with vars = Hashtbl.copy env.vars } in
+      Hashtbl.add body_env.vars over.over_chunk chunk_t;
+      List.iter (fun s -> ignore (check_stmt body_env s)) over.over_body;
       env
 
 (** Check tine predicate *)

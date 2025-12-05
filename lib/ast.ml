@@ -232,6 +232,23 @@ and stmt_kind =
   | SLet of binding                    (** let x = e *)
   | SAssign of ident * expr            (** x <- e *)
   | SExpr of expr                      (** expression statement *)
+  | SOver of over_loop                 (** over pack, count |> chunk: body *)
+
+(** Over loop: iterate over pack in stack-sized chunks
+    over pack, count |> chunk:
+      body
+
+    Expands to:
+      for i = 0 to ceil(count / lanes):
+        chunk = load_stack(pack, i * lanes)
+        body (with tail masking on last iteration)
+*)
+and over_loop = {
+  over_pack: ident;                    (** pack variable to iterate *)
+  over_count: expr;                    (** element count expression *)
+  over_chunk: ident;                   (** binding for each stack chunk *)
+  over_body: stmt list;                (** body executed per chunk *)
+}
 
 [@@deriving show]
 
