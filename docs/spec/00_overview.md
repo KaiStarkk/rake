@@ -37,12 +37,18 @@ This is SIMD semantics made explicit in the language.
 ## Design Principles
 
 1. **Vectors are primitive** — A `rack` is one SIMD register, not an array
-2. **Scalars are marked** — `<name>` broadcasts, preventing accidental confusion
-3. **Control flow is predication** — No branches; tines create masks, `through` applies them
-4. **Data layout is explicit** — `stack` (SoA) vs `single` (scalars) is visible
-5. **Vocabulary matches semantics** — `tine`, `rake`, `through`, `sweep` reinforce parallel thinking
-6. **Vertical = parallel time** — Same-indentation operations are conceptually simultaneous
-7. **Syntax serves cognition** — Visual structure implies execution model
+2. **Scalars are marked** — `<name>` broadcasts, preventing accidental confusion.
+3.   `<>` are used to visually represnt SIMD broadcast (spreads a scalar out across the whole lane, like a flood fill)
+4. **Control flow is predication** — No branches; tines create masks, `through` applies them
+5. **Data layout is explicit** — `stack` (SoA) vs `single` (scalars) is visible
+6. **Vocabulary matches semantics** — `tine`, `rake`, `through`, `sweep` reinforce parallel thinking
+7. **Vertical = parallel time** — Same-indentation operations are conceptually simultaneous
+8. **Syntax serves cognition** — Visual structure implies execution model
+
+The problem isn't that we can't write vectorized code. It's that the ergonomics in most languages for intrinsics are atrocious.
+The reason for this is that vectors are a bolt-on to a fundamentally scalar mental model for legacy reasons.
+Rake is a fresh start where every design decision has been made to encourage programmers to slip more naturally into a
+parallel mental model.
 
 ## Vocabulary
 
