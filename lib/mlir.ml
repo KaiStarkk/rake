@@ -27,6 +27,10 @@ type ctx = {
   tines: (string, string) Hashtbl.t; (* Tine name -> mask SSA name *)
   types: (string, Types.t) Hashtbl.t; (* Type definitions *)
   type_env: Typecheck.env;
+  pack_memrefs: (string, string) Hashtbl.t;  (* "pack.field" -> memref SSA name *)
+  mutable current_over_offset: string option; (* Current over loop offset for loads *)
+  mutable current_over_mask: string option;   (* Current tail mask for masked stores *)
+  mutable output_memref: string option;        (* Output memref for run function results *)
 }
 
 let create_ctx env = {
@@ -37,6 +41,10 @@ let create_ctx env = {
   tines = Hashtbl.create 16;
   types = env.Typecheck.types;
   type_env = env;
+  pack_memrefs = Hashtbl.create 32;
+  current_over_offset = None;
+  current_over_mask = None;
+  output_memref = None;
 }
 
 (** Generate fresh SSA name *)
@@ -248,7 +256,7 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
            let arg_vals = List.map fst arg_results in
            let arg_types = List.map (fun (_, t) -> mlir_type t) arg_results in
            let result = fresh ctx "call" in
-           emit ctx "%s = call @%s(%s) : (%s) -> %s"
+           emit ctx "%s = func.call @%s(%s) : (%s) -> %s"
              result name
              (String.concat ", " arg_vals)
              (String.concat ", " arg_types)
@@ -256,16 +264,32 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
            (result, Rack SFloat))
 
   | EField (e, field) ->
-      let (base, t) = emit_expr ctx e in
-      (* For now, assume fields are stored as separate variables *)
-      let field_var = base ^ "_" ^ field in
-      (match Hashtbl.find_opt ctx.vars field_var with
-       | Some ssa -> (ssa, get_field_type t field)
-       | None ->
-           (* Create a placeholder - real implementation would extract from struct *)
-           let result = fresh ctx field in
-           emit ctx "// Field access: %s.%s" base field;
-           (result, get_field_type t field))
+      (* First check if this is a direct variable field access (e.g., chunk.ox) *)
+      (match e.v with
+       | EVar var_name ->
+           (* Try chunk.field format first (for over loop bindings) *)
+           let chunk_field_key = var_name ^ "." ^ field in
+           (match Hashtbl.find_opt ctx.vars chunk_field_key with
+            | Some ssa -> (ssa, Rack SFloat)  (* TODO: proper field type *)
+            | None ->
+                (* Fall back to base_field format *)
+                let (base, t) = emit_expr ctx e in
+                let field_var = base ^ "_" ^ field in
+                (match Hashtbl.find_opt ctx.vars field_var with
+                 | Some ssa -> (ssa, get_field_type t field)
+                 | None ->
+                     let result = fresh ctx field in
+                     emit ctx "// Field access: %s.%s" base field;
+                     (result, get_field_type t field)))
+       | _ ->
+           let (base, t) = emit_expr ctx e in
+           let field_var = base ^ "_" ^ field in
+           (match Hashtbl.find_opt ctx.vars field_var with
+            | Some ssa -> (ssa, get_field_type t field)
+            | None ->
+                let result = fresh ctx field in
+                emit ctx "// Field access: %s.%s" base field;
+                (result, get_field_type t field)))
 
   | EBroadcast e ->
       let (val_, t) = emit_expr ctx e in
@@ -361,8 +385,20 @@ let rec emit_stmt ctx (stmt: Ast.stmt) =
 
 (** Emit over loop: scf.for iterating over pack in chunks of lanes *)
 and emit_over_loop ctx (over: Ast.over_loop) =
-  (* Get count expression *)
-  let (count_val, _) = emit_expr ctx over.over_count in
+  (* Get count expression and its type - handle scalar variable specially *)
+  let (count_val, count_type) = match over.over_count.v with
+    | EScalarVar name ->
+        let v = match Hashtbl.find_opt ctx.vars name with
+         | Some v -> v
+         | None -> failwith ("Undefined count variable: " ^ name)
+        in
+        let t = match Hashtbl.find_opt ctx.type_env.vars name with
+         | Some t -> t
+         | None -> Scalar SFloat
+        in
+        (v, t)
+    | _ -> emit_expr ctx over.over_count
+  in
 
   (* Constants for loop bounds *)
   let zero = fresh ctx "zero" in
@@ -374,9 +410,19 @@ and emit_over_loop ctx (over: Ast.over_loop) =
   emit ctx "%s = arith.constant 1 : index" one;
   emit ctx "%s = arith.constant %d : index" lanes_val vector_width;
 
-  (* Cast count to index if needed *)
+  (* Cast count to index - handle both integer and float types *)
   let count_idx = fresh ctx "count_idx" in
-  emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_val;
+  (match count_type with
+   | Scalar SInt64 ->
+       emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_val
+   | Scalar SInt ->
+       emit ctx "%s = arith.index_cast %s : i32 to index" count_idx count_val
+   | Scalar SFloat ->
+       let count_i64 = fresh ctx "count_i64" in
+       emit ctx "%s = arith.fptosi %s : f32 to i64" count_i64 count_val;
+       emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_i64
+   | _ ->
+       emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_val);
 
   (* Compute number of full iterations: ceil(count / lanes) *)
   let count_plus = fresh ctx "count_plus" in
@@ -394,27 +440,60 @@ and emit_over_loop ctx (over: Ast.over_loop) =
   let offset = fresh ctx "offset" in
   emit ctx "%s = arith.muli %s, %s : index" offset iter_var lanes_val;
 
+  (* Store offset for field access *)
+  ctx.current_over_offset <- Some offset;
+
   (* Compute tail mask for last iteration *)
   let remaining = fresh ctx "remaining" in
-  let is_tail = fresh ctx "is_tail" in
   let mask = fresh ctx "mask" in
-  let mask_remaining = fresh ctx "mask_rem" in
-  let all_true = fresh ctx "all_true" in
 
   emit ctx "%s = arith.subi %s, %s : index" remaining count_idx offset;
-  emit ctx "%s = arith.cmpi ult, %s, %s : index" is_tail remaining lanes_val;
-  emit ctx "%s = arith.index_cast %s : index to i32" mask_remaining remaining;
-  emit ctx "%s = arith.constant dense<true> : %s" all_true vec_i1;
-  emit ctx "%s = vector.create_mask %s : %s" mask mask_remaining vec_i1;
+  emit ctx "%s = vector.create_mask %s : %s" mask remaining vec_i1;
 
-  (* TODO: Load chunk from pack at offset, bind to over.over_chunk *)
-  (* For now, emit a placeholder comment *)
-  emit ctx "// Load chunk '%s' from pack '%s' at offset %%offset" over.over_chunk over.over_pack;
-  emit ctx "// Tail mask available in %s for masked operations" mask;
+  (* Store mask in context for masked operations *)
+  ctx.current_over_mask <- Some mask;
 
-  (* Emit body statements *)
-  List.iter (emit_stmt ctx) over.over_body;
+  (* Load chunk fields from pack memrefs *)
+  (* Look up pack type to get field names *)
+  (match Hashtbl.find_opt ctx.type_env.vars over.over_pack with
+   | Some (Pack (_, fields)) ->
+       List.iter (fun (field_name, _field_type) ->
+         let memref_key = over.over_pack ^ "." ^ field_name in
+         match Hashtbl.find_opt ctx.pack_memrefs memref_key with
+         | Some memref ->
+             let loaded = fresh ctx field_name in
+             emit ctx "%s = vector.load %s[%s] : memref<?xf32>, %s" loaded memref offset vec_f32;
+             (* Bind chunk.field_name to loaded value *)
+             Hashtbl.add ctx.vars (over.over_chunk ^ "." ^ field_name) loaded
+         | None ->
+             emit ctx "// Warning: no memref for %s" memref_key
+       ) fields
+   | _ ->
+       emit ctx "// Warning: pack type not found for %s" over.over_pack);
 
+  (* Emit body statements, capture result of last expression *)
+  let result_val = ref None in
+  List.iter (fun stmt ->
+    match stmt.Ast.v with
+    | Ast.SExpr e ->
+        let (v, _) = emit_expr ctx e in
+        result_val := Some v
+    | _ ->
+        emit_stmt ctx stmt
+  ) over.over_body;
+
+  (* Store result to output memref if available *)
+  (match (!result_val, ctx.output_memref) with
+   | (Some result, Some out_memref) ->
+       emit ctx "vector.maskedstore %s[%s], %s, %s : memref<?xf32>, vector<8xi1>, %s"
+         out_memref offset mask result vec_f32
+   | (Some result, None) ->
+       emit ctx "// Result %s computed but no output memref" result
+   | _ ->
+       emit ctx "// No result expression in over loop body");
+
+  ctx.current_over_offset <- None;
+  ctx.current_over_mask <- None;
   ctx.indent <- ctx.indent - 1;
   emit ctx "}"
 
@@ -616,7 +695,7 @@ let emit_rake ctx name params _result setup tines throughs sweep =
   emit ctx "}"
 
 (** Emit a definition *)
-let emit_def ctx (def: Ast.def) =
+let rec emit_def ctx (def: Ast.def) =
   match def.v with
   | DStack (name, fields) ->
       emit ctx "// Stack type: %s" name;
@@ -640,7 +719,92 @@ let emit_def ctx (def: Ast.def) =
       emit_rake ctx name params result setup tines throughs sweep
 
   | DRun (name, params, result, body) ->
-      emit_crunch ctx name params result body
+      emit_run ctx name params result body
+
+(** Emit run function with pack parameter expansion *)
+and emit_run ctx name params _result body =
+  (* Expand pack parameters to memrefs, keep scalars as-is *)
+  let param_counter = ref 0 in
+  let param_strs = List.concat_map (fun p ->
+    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
+    let pty_opt = match p with
+      | PRack (_, t) -> t
+      | PScalar (_, t) -> t
+    in
+    (* Check if this is a pack parameter *)
+    let is_pack = match pty_opt with
+      | Some ty -> (match ty.v with TPack _ -> true | _ -> false)
+      | None -> false
+    in
+    let is_scalar = match p with PScalar _ -> true | _ -> false in
+
+    if is_pack then begin
+      (* Look up pack type and expand to memrefs for each field *)
+      let pack_type_name = match pty_opt with
+        | Some ty -> (match ty.v with TPack n -> n | _ -> pname)
+        | None -> pname
+      in
+      match Hashtbl.find_opt ctx.types pack_type_name with
+      | Some (Stack (_, fields)) | Some (Pack (_, fields)) ->
+          List.map (fun (field_name, _) ->
+            let arg_idx = !param_counter in
+            incr param_counter;
+            let arg = Printf.sprintf "%%arg%d" arg_idx in
+            let memref_key = pname ^ "." ^ field_name in
+            Hashtbl.add ctx.pack_memrefs memref_key arg;
+            (* Also register the pack in vars for type lookup in over loop *)
+            Hashtbl.add ctx.type_env.vars pname (Pack (pack_type_name, fields));
+            Printf.sprintf "%s: memref<?xf32>" arg
+          ) fields
+      | _ ->
+          let arg_idx = !param_counter in
+          incr param_counter;
+          let arg = Printf.sprintf "%%arg%d" arg_idx in
+          Hashtbl.add ctx.vars pname arg;
+          [Printf.sprintf "%s: memref<?xf32>" arg]
+    end else if is_scalar then begin
+      let arg_idx = !param_counter in
+      incr param_counter;
+      let arg = Printf.sprintf "%%arg%d" arg_idx in
+      Hashtbl.add ctx.vars pname arg;
+      (* Determine scalar type from annotation *)
+      let scalar_type = match pty_opt with
+        | Some ty -> (match ty.v with
+            | TScalar PInt64 -> Scalar SInt64
+            | TScalar PInt -> Scalar SInt
+            | TScalar PDouble -> Scalar SDouble
+            | TScalar PBool -> Scalar SBool
+            | _ -> Scalar SFloat)
+        | None -> Scalar SFloat
+      in
+      Hashtbl.add ctx.type_env.vars pname scalar_type;
+      let mlir_ty = mlir_type scalar_type in
+      [Printf.sprintf "%s: %s" arg mlir_ty]
+    end else begin
+      let arg_idx = !param_counter in
+      incr param_counter;
+      let arg = Printf.sprintf "%%arg%d" arg_idx in
+      Hashtbl.add ctx.vars pname arg;
+      Hashtbl.add ctx.type_env.vars pname (Rack SFloat);
+      [Printf.sprintf "%s: %s" arg vec_f32]
+    end
+  ) params in
+
+  (* Add output memref for result *)
+  let output_arg = Printf.sprintf "%%arg%d" !param_counter in
+  let param_strs = param_strs @ [Printf.sprintf "%s: memref<?xf32>" output_arg] in
+  ctx.output_memref <- Some output_arg;
+
+  emit ctx "func.func @%s(%s) {" name (String.concat ", " param_strs);
+  ctx.indent <- ctx.indent + 1;
+
+  (* Emit body *)
+  List.iter (emit_stmt ctx) body;
+
+  ctx.output_memref <- None;
+  emit ctx "func.return";
+  ctx.indent <- ctx.indent - 1;
+  emit ctx "}"
 
 (** Emit a module *)
 let emit_module ctx (m: Ast.module_) =
