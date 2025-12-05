@@ -5,17 +5,16 @@
 Rake is named for its execution model: **data rakes through tine patterns**.
 
 ```
-        ↓↓↓↓↓↓↓↓  (8 lanes of data enter)
-    ════════════════════
-    |  tine A  |████░░██░░████░░██|  (some lanes blocked)
-    ════════════════════
-        ↓↓  ↓↓    ↓↓  ↓↓  (survivors continue)
-    ════════════════════
-    |  tine B  |░░░░██░░░░░░██░░░░|  (different pattern)
-    ════════════════════
-        ↓↓      ↓↓        (fewer survivors)
-           ↓
-        sweep:           (collect results)
+                ↓  ↓  ↓  ↓  ↓  ↓  ↓  ↓   (8 lanes of data enter)
+    ════════════════════════════════════
+    |  tine A |███░░░███░░░███░░░██████| (some lanes blocked)
+    ════════════════════════════════════
+                   ↓     ↓     ↓         (survivors continue)
+    ═══════════════════════════════════
+    |  tine B |░░░███░░░░░░███░░░░░░███| (different pattern)
+    ═══════════════════════════════════
+                         ↓     ↓         (fewer survivors)
+        sweep:           <     <         (collect results)
 ```
 
 Each **tine** is a horizontal barrier — the teeth of a rake — that filters lanes.
