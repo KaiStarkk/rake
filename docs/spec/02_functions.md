@@ -68,24 +68,54 @@ rake <name> <params> -> <result>:
   -> <result>
 ```
 
-## Run: Sequential Orchestration
+## Run: Pack Iteration Entry Point
 
-A `run` block handles sequential composition over time:
+A `run` function is the entry point for processing packs of data. The `over` construct
+iterates over pack data in SIMD-width chunks with automatic tail masking.
 
 ```rake
-run simulate particles <cfg> <frames> -> particles':
-  repeat <frames> times:
-    over particles -> p:
-      p <- update_particle p <cfg>
-
-  results in particles
+~~ Process rays through a raytracer
+run render_all (rays : Ray pack) (<count> : int64)
+               (<sphere_cx> : float) (<sphere_cy> : float)
+               (<sphere_cz> : float) (<sphere_r> : float)
+               -> result:
+  over rays, <count> |> ray:
+    let t = intersect_flat(ray.ox, ray.oy, ray.oz,
+                           ray.dx, ray.dy, ray.dz,
+                           <sphere_cx>, <sphere_cy>,
+                           <sphere_cz>, <sphere_r>)
+    t
 ```
 
-**Constructs available in `run`**:
-- `over pack -> binding:` — iterate over pack chunks
-- `repeat <n> times:` — temporal iteration
-- `repeat until <cond>:` — conditional iteration
-- Mutable bindings with `<-`
+**The `over` construct**:
+- `over pack, count |> binding:` — iterate over pack in SIMD-width chunks
+- Automatically handles tail masking for non-multiple-of-8 counts
+- Pack fields become vector loads from the corresponding memrefs
+- Results are stored via masked stores to output buffer
+
+**Generated MLIR for `over`**:
+```mlir
+scf.for %i = %zero to %num_iters step %one {
+  %offset = arith.muli %i, %lanes : index
+  %remaining = arith.subi %count, %offset : index
+  %mask = vector.create_mask %remaining : vector<8xi1>
+
+  // Load pack fields
+  %ox = vector.load %rays_ox[%offset] : memref<?xf32>, vector<8xf32>
+  %oy = vector.load %rays_oy[%offset] : memref<?xf32>, vector<8xf32>
+  // ... other fields
+
+  // Compute
+  %result = call @intersect_flat(...) : (...) -> vector<8xf32>
+
+  // Masked store
+  vector.maskedstore %output[%offset], %mask, %result
+}
+```
+
+**Pack type expansion**:
+When a pack type is used as a parameter, it expands to separate memrefs for each field:
+- `(rays : Ray pack)` → `memref<?xf32>` for each field (ox, oy, oz, dx, dy, dz)
 
 ## Parameter Syntax
 

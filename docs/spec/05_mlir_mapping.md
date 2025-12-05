@@ -175,6 +175,41 @@ shuffled <- v ~> [3, 2, 1, 0, 7, 6, 5, 4]
     : vector<8xf32>, vector<8xf32>
 ```
 
+### Over → scf.for with masked stores
+
+```rake
+over rays, <count> |> ray:
+  compute(ray.ox, ray.oy, ...)
+```
+
+```mlir
+%lanes = arith.constant 8 : index
+%zero = arith.constant 0 : index
+%one = arith.constant 1 : index
+%count_idx = arith.index_cast %count : i64 to index
+%lanes_m1 = arith.constant 7 : index
+%count_plus = arith.addi %count_idx, %lanes_m1 : index
+%niters = arith.divui %count_plus, %lanes : index
+
+scf.for %i = %zero to %niters step %one {
+  %offset = arith.muli %i, %lanes : index
+  %remaining = arith.subi %count_idx, %offset : index
+  %mask = vector.create_mask %remaining : vector<8xi1>
+
+  // Load fields from pack memrefs
+  %ox = vector.load %rays_ox[%offset] : memref<?xf32>, vector<8xf32>
+  %oy = vector.load %rays_oy[%offset] : memref<?xf32>, vector<8xf32>
+  // ...
+
+  // Call computation
+  %result = func.call @compute(%ox, %oy, ...) : (...) -> vector<8xf32>
+
+  // Masked store to output
+  vector.maskedstore %output[%offset], %mask, %result
+      : memref<?xf32>, vector<8xi1>, vector<8xf32>
+}
+```
+
 ### FMA
 
 ```rake

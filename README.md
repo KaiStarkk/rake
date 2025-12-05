@@ -2,32 +2,44 @@
 
 **A vector-first language for CPU SIMD with divergent control flow.**
 
-Rake achieves **3x speedup** over auto-vectorized C code with branching issues by making SIMD explicit in the language design, not an afterthought.
-Other languages can do this too with intrinsics or handrolling assembly, but rakes purpose is to help the programmer write vectorized code without the migraine.
+Rake achieves **2x+ speedup** over scalar C code, matching hand-written AVX2 intrinsics—with clean, readable syntax.
+
+Other languages can do this too with intrinsics or handrolling assembly, but Rake's purpose is to help the programmer write vectorized code without the migraine.
 
 ```rake
 ~~ Ray-sphere intersection: clean code, no intrinsics, full SIMD performance
-rake intersect ray_ox ray_oy ray_oz ray_dx ray_dy ray_dz
+rake intersect_flat ray_ox ray_oy ray_oz ray_dx ray_dy ray_dz
   <sphere_cx> <sphere_cy> <sphere_cz> <sphere_r>
   -> t_result:
 
+  ~~ Setup: compute quadratic coefficients
+  let oc_x = ray_ox - <sphere_cx>
+  let oc_y = ray_oy - <sphere_cy>
+  let oc_z = ray_oz - <sphere_cz>
+
+  let a = dot(ray_dx, ray_dy, ray_dz, ray_dx, ray_dy, ray_dz)
+  let b = <2.0> * dot(oc_x, oc_y, oc_z, ray_dx, ray_dy, ray_dz)
+  let c = dot(oc_x, oc_y, oc_z, oc_x, oc_y, oc_z) - <sphere_r> * <sphere_r>
   let disc = b * b - <4.0> * a * c
 
+  ~~ Tines: partition lanes by hit/miss
   | #miss := (disc < <0.0>)
   | #hit  := (!#miss)
 
+  ~~ Through: compute only for hit lanes
   through #hit:
     let sqrt_disc = sqrt(disc)
-    (- b - sqrt_disc) / (<2.0> * a)
+    (neg(b) - sqrt_disc) / (<2.0> * a)
   -> t_value
 
   through #miss:
     <-1.0>
   -> miss_value
 
+  ~~ Sweep: collect results from all tines
   sweep:
-    | #miss -> miss_value
     | #hit  -> t_value
+    | #miss -> miss_value
   -> t_result
 ```
 
@@ -89,19 +101,40 @@ sweep:
 
 `sweep` combines results from different tines using masked selection.
 
+### Over: Iterate Over Packs
+
+```rake
+~~ Process all rays in a pack (automatic SIMD chunking)
+run render_all (rays : Ray pack) (<count> : int64)
+               (<sphere_cx> : float) (<sphere_cy> : float)
+               (<sphere_cz> : float) (<sphere_r> : float)
+               -> result:
+  over rays, <count> |> ray:
+    let t = intersect_flat(ray.ox, ray.oy, ray.oz,
+                           ray.dx, ray.dy, ray.dz,
+                           <sphere_cx>, <sphere_cy>,
+                           <sphere_cz>, <sphere_r>)
+    t
+```
+
+`over` iterates over pack data in SIMD-width chunks, automatically handling tail masking. This is the bridge between scalar control flow and vectorized computation.
+
 ## Performance
 
-Ray-sphere intersection benchmark (8M rays, 50% hit rate):
+Raytracer benchmark (1920×1080, 10 spheres, 100 iterations):
 
-| Implementation | Throughput | Speedup |
-|---------------|------------|---------|
-| C (auto-vectorized, `-O3 -march=native`) | 207.89 M rays/sec | 1.00x |
-| **Rake** | 677.89 M rays/sec | **3.26x** |
+| Implementation | Time/Frame | FPS | Speedup |
+|---------------|------------|-----|---------|
+| C Scalar | 60.90 ms | 16.4 | 1.00x |
+| C SIMD (hand-written AVX2) | 29.82 ms | 33.5 | 2.04x |
+| **Rake SIMD** | **29.85 ms** | **33.5** | **2.04x** |
 
-Rake generates clean AVX2 assembly with:
-- Zero function call overhead (inlined crunches)
+Rake matches hand-written AVX2 intrinsics—with clean, readable syntax.
+
+The compiler generates optimal AVX2 assembly with:
+- Link-time inlining (zero function call overhead)
 - Optimal mask handling via `vblendvps`
-- No unnecessary memory traffic
+- Masked stores for correct tail handling
 
 ## Installation
 
@@ -126,7 +159,7 @@ dune build
 
 - **crunch**: Pure vector computation. Always gets inlined.
 - **rake**: Divergent computation with tines/through/sweep.
-- **run**: Sequential orchestration (for control flow that can't be vectorized).
+- **run**: Entry point with pack iteration via `over`.
 
 ## Syntax Highlighting
 

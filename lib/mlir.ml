@@ -638,7 +638,7 @@ let emit_crunch ctx name params _result body =
     Printf.sprintf "%%arg%d: %s" i pty
   ) params in
 
-  emit ctx "func.func @%s(%s) -> %s {" name (String.concat ", " param_strs) vec_f32;
+  emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) vec_f32;
   ctx.indent <- ctx.indent + 1;
 
   (* Emit body *)
@@ -674,7 +674,7 @@ let emit_rake ctx name params _result setup tines throughs sweep =
     Printf.sprintf "%s: %s" arg pty
   ) params in
 
-  emit ctx "func.func @%s(%s) -> %s {" name (String.concat ", " param_strs) result_type;
+  emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) result_type;
   ctx.indent <- ctx.indent + 1;
 
   (* Emit setup statements *)
