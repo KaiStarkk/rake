@@ -2,7 +2,8 @@
 
 **A vector-first language for CPU SIMD with divergent control flow.**
 
-Rake achieves **3.26x speedup** over auto-vectorized C code by making SIMD explicit in the language design, not an afterthought.
+Rake achieves **3x speedup** over auto-vectorized C code with branching issues by making SIMD explicit in the language design, not an afterthought.
+Other languages can do this too with intrinsics or handrolling assembly, but rakes purpose is to help the programmer write vectorized code without the migraine.
 
 ```rake
 ~~ Ray-sphere intersection: clean code, no intrinsics, full SIMD performance
