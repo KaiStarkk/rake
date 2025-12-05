@@ -1,0 +1,25 @@
+-- Simple Rake 0.2.0 test file
+
+stack Point {
+  x : float rack,
+  y : float rack
+}
+
+crunch add a b -> c:
+  c <- a + b
+
+crunch square x -> y:
+  y <- x * x
+
+rake safe_sqrt x <zero> -> result:
+  | tine valid := x >= <zero>
+  | tine invalid := !valid
+
+  through valid else <zero>:
+    sqrt(x)
+  -> valid_result
+
+  sweep:
+    | valid -> valid_result
+    | invalid -> <zero>
+  -> result

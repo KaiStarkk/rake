@@ -1,0 +1,29 @@
+~~ Minimal test for the tine/through/sweep syntax
+~~ Comments use ~~ (rake marks in sand)
+
+stack Point {
+  x : float rack,
+  y : float rack
+}
+
+crunch add a b -> c:
+  c <- a + b
+
+~~ Rake with tine declarations using # syntax
+rake safe_sqrt x <zero> -> result:
+  | #valid   := (x >= <zero>)
+  | #invalid := (!#valid)
+
+  through #valid:
+    let root = sqrt(x)
+    root
+  -> valid_result
+
+  through #invalid:
+    <zero>
+  -> invalid_result
+
+  sweep:
+    | #valid   -> valid_result
+    | #invalid -> invalid_result
+  -> result

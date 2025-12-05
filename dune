@@ -1,1 +1,1 @@
-(dirs bin lib stdlib examples eval)
+(dirs lib bin examples test docs)

@@ -1,4 +1,4 @@
 (executable
  (name main)
- (public_name rakec)
+ (public_name rake)
  (libraries rake))

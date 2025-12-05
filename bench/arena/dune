@@ -1,3 +1,0 @@
-(executable
- (name arena)
- (libraries rake_eval_lib cmdliner))

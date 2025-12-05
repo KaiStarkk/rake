@@ -1,143 +1,136 @@
-(* Type representation for checking *)
+(** Rake 0.2.0 Type System
 
-type lane_count = int (* Target-dependent, e.g., 8 for AVX2 *)
+    Runtime type representation and operations.
+*)
 
+open Ast
+
+(** Scalar (element) types *)
 type scalar =
-  | SFloat
-  | SDouble
-  | SInt
-  | SInt8
-  | SInt16
-  | SInt64
-  | SUint
-  | SUint8
-  | SUint16
-  | SUint64
+  | SFloat | SDouble
+  | SInt | SInt8 | SInt16 | SInt64
+  | SUint | SUint8 | SUint16 | SUint64
   | SBool
 [@@deriving show, eq]
 
-type compound = CVec2 | CVec3 | CVec4 | CMat3 | CMat4 [@@deriving show, eq]
-
-type t =
-  | Rack of scalar
-  | CompoundRack of compound
-  | Scalar of scalar
-  | CompoundScalar of compound
-  | Stack of t * int option
-  | Array of t * int option
-  | Pack of string * (string * t) list
-  | Aos of string * (string * t) list
-  | Single of string * (string * t) list
-  | Mask
-  | Fun of t list * t
-  | Tuple of t list
-  | Unit
-  | Unknown
+(** Compound types *)
+type compound =
+  | CVec2 | CVec3 | CVec4
+  | CMat3 | CMat4
 [@@deriving show, eq]
 
-let of_prim (p : Ast.prim) : scalar =
-  match p with
-  | Ast.Float -> SFloat
-  | Ast.Double -> SDouble
-  | Ast.Int -> SInt
-  | Ast.Int8 -> SInt8
-  | Ast.Int16 -> SInt16
-  | Ast.Int64 -> SInt64
-  | Ast.Uint -> SUint
-  | Ast.Uint8 -> SUint8
-  | Ast.Uint16 -> SUint16
-  | Ast.Uint64 -> SUint64
-  | Ast.Bool -> SBool
+(** Field type for structs *)
+type field = string * t
 
-let of_compound (c : Ast.compound) : compound =
-  match c with
-  | Ast.Vec2 -> CVec2
-  | Ast.Vec3 -> CVec3
-  | Ast.Vec4 -> CVec4
-  | Ast.Mat3 -> CMat3
-  | Ast.Mat4 -> CMat4
+(** Runtime types *)
+and t =
+  | Rack of scalar                     (** vector<N x scalar> *)
+  | CompoundRack of compound           (** vector of compound *)
+  | Scalar of scalar                   (** single scalar value *)
+  | CompoundScalar of compound         (** single compound value *)
+  | Stack of ident * field list        (** SoA struct type *)
+  | Pack of ident * field list         (** collection of stacks *)
+  | Single of ident * field list       (** all-scalar struct *)
+  | Mask                               (** boolean vector (tine result) *)
+  | Fun of t list * t                  (** function type *)
+  | Tuple of t list                    (** tuple type *)
+  | Unit                               (** unit type *)
+  | Unknown                            (** placeholder for inference *)
+[@@deriving show]
 
+(** Convert AST primitive to scalar *)
+let of_prim = function
+  | PFloat -> SFloat
+  | PDouble -> SDouble
+  | PInt -> SInt
+  | PInt8 -> SInt8
+  | PInt16 -> SInt16
+  | PInt64 -> SInt64
+  | PUint -> SUint
+  | PUint8 -> SUint8
+  | PUint16 -> SUint16
+  | PUint64 -> SUint64
+  | PBool -> SBool
+
+(** Convert AST compound to compound *)
+let of_compound = function
+  | Ast.CVec2 -> CVec2
+  | Ast.CVec3 -> CVec3
+  | Ast.CVec4 -> CVec4
+  | Ast.CMat3 -> CMat3
+  | Ast.CMat4 -> CMat4
+
+(** Is this a rack (vector) type? *)
 let is_rack = function
   | Rack _ | CompoundRack _ | Mask -> true
-  | Pack _ -> true (* Packs contain racks *)
   | _ -> false
 
+(** Is this a scalar (uniform) type? *)
 let is_scalar = function
   | Scalar _ | CompoundScalar _ -> true
-  | Single _ -> true
   | _ -> false
 
+(** Is this a numeric type? *)
 let is_numeric = function
-  | Rack s | Scalar s -> ( match s with SBool -> false | _ -> true)
+  | Rack s | Scalar s -> (
+      match s with
+      | SFloat | SDouble | SInt | SInt8 | SInt16 | SInt64
+      | SUint | SUint8 | SUint16 | SUint64 -> true
+      | SBool -> false)
   | CompoundRack _ | CompoundScalar _ -> true
   | _ -> false
 
-(* Type of a broadcast: scalar -> rack *)
+(** Is this a floating-point type? *)
+let is_float = function
+  | Rack SFloat | Rack SDouble
+  | Scalar SFloat | Scalar SDouble
+  | CompoundRack _ | CompoundScalar _ -> true
+  | _ -> false
+
+(** Broadcast a scalar to a rack *)
 let broadcast = function
   | Scalar s -> Rack s
   | CompoundScalar c -> CompoundRack c
+  | t -> t  (* already a rack or other *)
+
+(** Get element type of a rack *)
+let element_type = function
+  | Rack s -> Scalar s
+  | CompoundRack c -> CompoundScalar c
+  | Mask -> Scalar SBool
   | t -> t
 
-(* Result of binary operation *)
+(** Binary operation result type *)
 let binop_result t1 t2 =
   match (t1, t2) with
-  | Rack _, _ -> t1
-  | _, Rack _ -> t2
-  | CompoundRack _, _ -> t1
-  | _, CompoundRack _ -> t2
-  | _ -> t1
+  (* Rack + Rack -> Rack *)
+  | Rack s1, Rack s2 when s1 = s2 -> Rack s1
+  (* Rack + Scalar -> Rack (broadcast) *)
+  | Rack s, Scalar _ -> Rack s
+  | Scalar _, Rack s -> Rack s
+  (* Float takes precedence *)
+  | Rack SFloat, _ | _, Rack SFloat -> Rack SFloat
+  | Rack SDouble, _ | _, Rack SDouble -> Rack SDouble
+  (* Default to first operand *)
+  | t, _ -> t
 
-(* Result of comparison *)
-let cmp_result t1 t2 =
-  match (t1, t2) with
-  | Rack _, _ | _, Rack _ -> Mask
-  | CompoundRack _, _ | _, CompoundRack _ -> Mask
-  | _ -> Scalar SBool
+(** Comparison result type (always mask) *)
+let cmp_result _t1 _t2 = Mask
 
-let rec pp fmt = function
-  | Rack s -> Format.fprintf fmt "%s rack" (pp_scalar s)
-  | CompoundRack c -> Format.fprintf fmt "%s rack" (pp_compound c)
-  | Scalar s -> Format.fprintf fmt "%s" (pp_scalar s)
-  | CompoundScalar c -> Format.fprintf fmt "%s" (pp_compound c)
-  | Stack (inner, None) -> Format.fprintf fmt "%a stack" pp inner
-  | Stack (inner, Some n) -> Format.fprintf fmt "%a stack[%d]" pp inner n
-  | Array (inner, None) -> Format.fprintf fmt "%a array" pp inner
-  | Array (inner, Some n) -> Format.fprintf fmt "%a array[%d]" pp inner n
-  | Pack (name, _) -> Format.fprintf fmt "%s" name
-  | Aos (name, _) -> Format.fprintf fmt "%s" name
-  | Single (name, _) -> Format.fprintf fmt "%s" name
-  | Mask -> Format.fprintf fmt "mask"
+(** Pretty-print type *)
+let rec show_concise = function
+  | Rack s -> show_scalar s ^ " rack"
+  | CompoundRack c -> show_compound c ^ " rack"
+  | Scalar s -> show_scalar s
+  | CompoundScalar c -> show_compound c
+  | Stack (name, _) -> name ^ " stack"
+  | Pack (name, _) -> name ^ " pack"
+  | Single (name, _) -> name ^ " single"
+  | Mask -> "mask"
   | Fun (args, ret) ->
-      Format.fprintf fmt "(%a) -> %a"
-        (Format.pp_print_list
-           ~pp_sep:(fun fmt () -> Format.fprintf fmt ", ")
-           pp)
-        args pp ret
+      "(" ^ String.concat ", " (List.map show_concise args) ^
+      ") -> " ^ show_concise ret
   | Tuple ts ->
-      Format.fprintf fmt "(%a)"
-        (Format.pp_print_list
-           ~pp_sep:(fun fmt () -> Format.fprintf fmt " * ")
-           pp)
-        ts
-  | Unit -> Format.fprintf fmt "()"
-  | Unknown -> Format.fprintf fmt "?"
-
-and pp_scalar = function
-  | SFloat -> "float"
-  | SDouble -> "double"
-  | SInt -> "int"
-  | SInt8 -> "int8"
-  | SInt16 -> "int16"
-  | SInt64 -> "int64"
-  | SUint -> "uint"
-  | SUint8 -> "uint8"
-  | SUint16 -> "uint16"
-  | SUint64 -> "uint64"
-  | SBool -> "bool"
-
-and pp_compound = function
-  | CVec2 -> "vec2"
-  | CVec3 -> "vec3"
-  | CVec4 -> "vec4"
-  | CMat3 -> "mat3"
-  | CMat4 -> "mat4"
+      "(" ^ String.concat ", " (List.map show_concise ts) ^ ")"
+  | Unit -> "()"
+  | Unknown -> "?"

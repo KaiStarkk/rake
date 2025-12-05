@@ -1,864 +1,599 @@
-(* MLIR Emission for rake *)
-(* Uses vector, arith, func, and scf dialects *)
+(** Rake 0.2.0 MLIR Emitter
+
+    Generates MLIR using the vector dialect for SIMD operations.
+
+    Key mappings:
+    - Tine predicates → arith.cmpf/cmpi → vector<8xi1>
+    - Through blocks → vector.mask with passthru
+    - Sweep → nested arith.select
+    - Scalars → vector.broadcast
+    - Reductions → vector.reduction
+
+    Target dialects: func, arith, vector, math
+*)
 
 open Ast
-open Printf
+open Types
 
-let vector_width = 8 (* AVX2 default, configurable *)
+(** Vector width (default AVX2) *)
+let vector_width = 8
 
-type context = {
-  buf : Buffer.t;
-  mutable counter : int;
-  mutable indent : int;
-  mutable funcs : (string * Types.t) list; (* function name -> return type *)
-  mutable values : (string * string) list; (* variable name -> SSA value *)
+(** Emission context *)
+type ctx = {
+  mutable buf: Buffer.t;
+  mutable indent: int;
+  mutable ssa_counter: int;
+  vars: (string, string) Hashtbl.t;  (* Rake var -> MLIR SSA name *)
+  tines: (string, string) Hashtbl.t; (* Tine name -> mask SSA name *)
+  types: (string, Types.t) Hashtbl.t; (* Type definitions *)
+  type_env: Typecheck.env;
 }
 
-let fresh ctx prefix =
-  ctx.counter <- ctx.counter + 1;
-  sprintf "%%%s%d" prefix ctx.counter
+let create_ctx env = {
+  buf = Buffer.create 4096;
+  indent = 0;
+  ssa_counter = 0;
+  vars = Hashtbl.create 64;
+  tines = Hashtbl.create 16;
+  types = env.Typecheck.types;
+  type_env = env;
+}
 
+(** Generate fresh SSA name *)
+let fresh ctx prefix =
+  let n = ctx.ssa_counter in
+  ctx.ssa_counter <- n + 1;
+  Printf.sprintf "%%%s%d" prefix n
+
+(** Emit with indentation *)
 let emit ctx fmt =
   for _ = 1 to ctx.indent do
     Buffer.add_string ctx.buf "  "
   done;
   Printf.kbprintf (fun _ -> Buffer.add_char ctx.buf '\n') ctx.buf fmt
 
-(* MLIR type emission *)
-let mlir_scalar_type = function
-  | Types.SFloat -> "f32"
-  | Types.SDouble -> "f64"
-  | Types.SInt -> "i32"
-  | Types.SInt8 -> "i8"
-  | Types.SInt16 -> "i16"
-  | Types.SInt64 -> "i64"
-  | Types.SUint -> "i32"
-  | Types.SUint8 -> "i8"
-  | Types.SUint16 -> "i16"
-  | Types.SUint64 -> "i64"
-  | Types.SBool -> "i1"
+(** Emit without newline *)
+let emit_inline ctx fmt =
+  for _ = 1 to ctx.indent do
+    Buffer.add_string ctx.buf "  "
+  done;
+  Printf.kbprintf (fun _ -> ()) ctx.buf fmt
 
+(** MLIR type for Rake type *)
 let rec mlir_type = function
-  | Types.Rack s -> sprintf "vector<%dx%s>" vector_width (mlir_scalar_type s)
-  | Types.CompoundRack Types.CVec3 -> sprintf "!rake.vec3rack<%d>" vector_width
-  | Types.CompoundRack Types.CVec4 -> sprintf "!rake.vec4rack<%d>" vector_width
-  | Types.CompoundRack _ -> sprintf "vector<%dxf32>" vector_width
-  | Types.Scalar s -> mlir_scalar_type s
-  | Types.CompoundScalar _ -> "!rake.vec3"
-  | Types.Mask -> sprintf "vector<%dxi1>" vector_width
-  | Types.Pack (name, _) -> sprintf "!rake.soa_%s" name
-  | Types.Aos (name, _) -> sprintf "!rake.aos_%s" name
-  | Types.Single (name, _) -> sprintf "!rake.single_%s" name
-  | Types.Stack (inner, _) -> sprintf "!rake.stack<%s>" (mlir_type inner)
-  | Types.Array (inner, _) -> sprintf "memref<?x%s>" (mlir_type inner)
-  | Types.Fun (args, ret) ->
-      sprintf "(%s) -> %s"
-        (String.concat ", " (List.map mlir_type args))
-        (mlir_type ret)
-  | Types.Tuple ts ->
-      sprintf "tuple<%s>" (String.concat ", " (List.map mlir_type ts))
-  | Types.Unit -> "()"
-  | Types.Unknown -> "!rake.unknown"
+  | Rack SFloat -> Printf.sprintf "vector<%dxf32>" vector_width
+  | Rack SDouble -> Printf.sprintf "vector<%dxf64>" vector_width
+  | Rack SInt -> Printf.sprintf "vector<%dxi32>" vector_width
+  | Rack SInt64 -> Printf.sprintf "vector<%dxi64>" vector_width
+  | Rack SBool -> Printf.sprintf "vector<%dxi1>" vector_width
+  | Scalar SFloat -> "f32"
+  | Scalar SDouble -> "f64"
+  | Scalar SInt -> "i32"
+  | Scalar SInt64 -> "i64"
+  | Scalar SBool -> "i1"
+  | Mask -> Printf.sprintf "vector<%dxi1>" vector_width
+  | Stack (_name, fields) ->
+      (* For now, emit as tuple of vectors *)
+      let field_types = List.map (fun (_, t) -> mlir_type t) fields in
+      "tuple<" ^ String.concat ", " field_types ^ ">"
+  | Single (_name, fields) ->
+      (* Single types are tuples of scalars *)
+      let field_types = List.map (fun (_, t) -> mlir_type t) fields in
+      "tuple<" ^ String.concat ", " field_types ^ ">"
+  | Tuple ts ->
+      "tuple<" ^ String.concat ", " (List.map mlir_type ts) ^ ">"
+  | Unit -> "()"
+  | _ -> "!rake.unknown"
 
-let mlir_prim_type p =
-  sprintf "vector<%dx%s>" vector_width (mlir_scalar_type (Types.of_prim p))
+(** MLIR type for vector of floats *)
+let vec_f32 = Printf.sprintf "vector<%dxf32>" vector_width
+let vec_i1 = Printf.sprintf "vector<%dxi1>" vector_width
 
-(* Emit a splat (broadcast scalar to vector) *)
-let emit_splat ctx scalar_val scalar_type =
-  let result = fresh ctx "splat" in
-  let vec_type = sprintf "vector<%dx%s>" vector_width scalar_type in
-  emit ctx "%s = vector.splat %s : %s" result scalar_val vec_type;
-  result
-
-(* Emit vector binary operation *)
-let emit_binop ctx is_float op lhs rhs vec_type =
-  let result = fresh ctx "r" in
-  let mlir_op =
-    match op with
+(** Emit a binary operation *)
+let emit_binop ctx op t1 t2 lhs rhs =
+  let result = fresh ctx "v" in
+  let is_float = match t1 with
+    | Rack SFloat | Rack SDouble | Scalar SFloat | Scalar SDouble -> true
+    | _ -> false
+  in
+  let op_name = match op with
     | Add -> if is_float then "arith.addf" else "arith.addi"
     | Sub -> if is_float then "arith.subf" else "arith.subi"
     | Mul -> if is_float then "arith.mulf" else "arith.muli"
     | Div -> if is_float then "arith.divf" else "arith.divsi"
-    | Mod -> if is_float then "arith.remf" else "arith.remsi"
+    | Mod -> "arith.remsi"
+    | Lt -> if is_float then "arith.cmpf olt" else "arith.cmpi slt"
+    | Le -> if is_float then "arith.cmpf ole" else "arith.cmpi sle"
+    | Gt -> if is_float then "arith.cmpf ogt" else "arith.cmpi sgt"
+    | Ge -> if is_float then "arith.cmpf oge" else "arith.cmpi sge"
+    | Eq -> if is_float then "arith.cmpf oeq" else "arith.cmpi eq"
+    | Ne -> if is_float then "arith.cmpf one" else "arith.cmpi ne"
     | And -> "arith.andi"
     | Or -> "arith.ori"
-    | _ -> "arith.addi" (* comparisons handled separately *)
+    | _ -> "arith.addf"  (* TODO: handle other ops *)
   in
-  emit ctx "%s = %s %s, %s : %s" result mlir_op lhs rhs vec_type;
+  let result_type = match op with
+    | Lt | Le | Gt | Ge | Eq | Ne -> vec_i1
+    | _ -> mlir_type (binop_result t1 t2)
+  in
+  emit ctx "%s = %s %s, %s : %s" result op_name lhs rhs result_type;
   result
 
-(* Emit comparison *)
-let emit_cmp ctx is_float op lhs rhs vec_type =
-  let result = fresh ctx "cmp" in
-  let predicate, dialect =
-    match op with
-    | Lt -> if is_float then ("olt", "arith.cmpf") else ("slt", "arith.cmpi")
-    | Le -> if is_float then ("ole", "arith.cmpf") else ("sle", "arith.cmpi")
-    | Gt -> if is_float then ("ogt", "arith.cmpf") else ("sgt", "arith.cmpi")
-    | Ge -> if is_float then ("oge", "arith.cmpf") else ("sge", "arith.cmpi")
-    | Eq -> if is_float then ("oeq", "arith.cmpf") else ("eq", "arith.cmpi")
-    | Ne -> if is_float then ("one", "arith.cmpf") else ("ne", "arith.cmpi")
-    | _ -> ("eq", "arith.cmpi")
-  in
-  emit ctx "%s = %s %s, %s, %s : %s" result dialect predicate lhs rhs vec_type;
+(** Emit a unary operation *)
+let emit_unop ctx op t arg =
+  let result = fresh ctx "v" in
+  let ty = mlir_type t in
+  (match op with
+   | Neg | FNeg ->
+       emit ctx "%s = arith.negf %s : %s" result arg ty
+   | Not ->
+       (* For masks, use xor with all-ones *)
+       let ones = fresh ctx "ones" in
+       emit ctx "%s = arith.constant dense<true> : %s" ones vec_i1;
+       emit ctx "%s = arith.xori %s, %s : %s" result arg ones vec_i1);
   result
 
-(* Expression emission - returns (value_name, type) *)
-let rec emit_expr ctx env (e : expr) : string * Types.t =
-  match e.v with
+(** Emit broadcast of scalar to vector (only if needed) *)
+let emit_broadcast ctx scalar_val scalar_type =
+  match scalar_type with
+  | Rack _ | Mask ->
+      (* Already a vector, no broadcast needed *)
+      scalar_val
+  | _ ->
+      let result = fresh ctx "bcast" in
+      let vec_type = match scalar_type with
+        | Scalar SFloat -> vec_f32
+        | Scalar SInt -> Printf.sprintf "vector<%dxi32>" vector_width
+        | _ -> vec_f32
+      in
+      emit ctx "%s = vector.broadcast %s : %s to %s" result scalar_val
+        (mlir_type scalar_type) vec_type;
+      result
+
+(** Emit expression, return SSA name and type *)
+let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
+  match expr.v with
   | EInt n ->
-      let scalar = fresh ctx "c" in
-      emit ctx "%s = arith.constant %Ld : i32" scalar n;
-      let vec = emit_splat ctx scalar "i32" in
-      (vec, Types.Rack Types.SInt)
+      let result = fresh ctx "c" in
+      (* In vector context, treat integers as floats for arithmetic *)
+      emit ctx "%s = arith.constant dense<%Ld.0> : %s" result n vec_f32;
+      (result, Rack SFloat)
+
   | EFloat f ->
-      let scalar = fresh ctx "c" in
-      emit ctx "%s = arith.constant %f : f32" scalar f;
-      let vec = emit_splat ctx scalar "f32" in
-      (vec, Types.Rack Types.SFloat)
+      let result = fresh ctx "c" in
+      (* Use proper float formatting to ensure decimal point *)
+      let f_str = if Float.is_integer f then Printf.sprintf "%.1f" f else Printf.sprintf "%g" f in
+      emit ctx "%s = arith.constant dense<%s> : %s" result f_str vec_f32;
+      (result, Rack SFloat)
+
   | EBool b ->
-      let scalar = fresh ctx "c" in
-      let v = if b then "1" else "0" in
-      emit ctx "%s = arith.constant %s : i1" scalar v;
-      let vec = emit_splat ctx scalar "i1" in
-      (vec, Types.Mask)
-  | EVar name ->
-      let t =
-        match Hashtbl.find_opt env name with
-        | Some t -> t
-        | None -> (
-            (* Could be a function - look in ctx.funcs *)
-            try List.assoc name ctx.funcs with Not_found -> Types.Unknown)
-      in
-      (* Check if there's an SSA value mapping for this name *)
-      let ssa_val =
-        try List.assoc name ctx.values with Not_found -> sprintf "%%%s" name
-      in
-      (ssa_val, t)
-  | EScalarVar name ->
-      (* Scalar variable - broadcast to vector *)
-      let t =
-        match Hashtbl.find_opt env name with
-        | Some t -> t
-        | None -> Types.Scalar Types.SFloat
-      in
-      let vec =
-        emit_splat ctx (sprintf "%%%s" name)
-          (mlir_scalar_type
-             (match t with Types.Scalar s -> s | _ -> Types.SFloat))
-      in
-      (vec, Types.broadcast t)
-  | EBinop (l, op, r) -> (
-      (* Handle Pipe specially before evaluating - needs AST nodes for fusion *)
-      match op with
-      | Pipe ->
-          emit ctx "// Pipeline via binop";
-          emit_pipe_fused ctx env l r
-      | _ -> (
-          let lv, lt = emit_expr ctx env l in
-          let rv, rt = emit_expr ctx env r in
-          (* Determine if either operand is float for type coercion *)
-          let is_float_l =
-            match lt with
-            | Types.Rack Types.SFloat | Types.Rack Types.SDouble -> true
-            | _ -> false
+      let result = fresh ctx "c" in
+      emit ctx "%s = arith.constant dense<%b> : %s" result b vec_i1;
+      (result, Mask)
+
+  | EVar name -> (
+      match Hashtbl.find_opt ctx.vars name with
+      | Some ssa_name ->
+          let t = match Hashtbl.find_opt ctx.type_env.vars name with
+            | Some t -> t
+            | None -> Rack SFloat
           in
-          let is_float_r =
-            match rt with
-            | Types.Rack Types.SFloat | Types.Rack Types.SDouble -> true
-            | _ -> false
+          (ssa_name, t)
+      | None ->
+          (* Undefined variable - shouldn't happen after type checking *)
+          let result = fresh ctx "undef" in
+          emit ctx "%s = arith.constant dense<0.0> : %s" result vec_f32;
+          (result, Rack SFloat))
+
+  | EScalarVar name -> (
+      match Hashtbl.find_opt ctx.vars name with
+      | Some ssa_name ->
+          let t = match Hashtbl.find_opt ctx.type_env.vars name with
+            | Some t -> t
+            | None -> Scalar SFloat
           in
-          let is_float = is_float_l || is_float_r in
-          (* Coerce int to float if needed for mixed comparisons *)
-          let lv, lt =
-            if is_float && not is_float_l then (
-              let conv = fresh ctx "sitofp" in
-              emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-                conv lv vector_width vector_width;
-              (conv, Types.Rack Types.SFloat))
-            else (lv, lt)
-          in
-          let rv =
-            if is_float && not is_float_r then (
-              let conv = fresh ctx "sitofp" in
-              emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-                conv rv vector_width vector_width;
-              conv)
-            else rv
-          in
-          let vec_type = mlir_type lt in
-          match op with
-          | Lt | Le | Gt | Ge | Eq | Ne ->
-              let result = emit_cmp ctx is_float op lv rv vec_type in
-              (result, Types.Mask)
-          | _ ->
-              let result = emit_binop ctx is_float op lv rv vec_type in
-              (result, lt)))
-  | EUnop (Neg, e) ->
-      let v, t = emit_expr ctx env e in
-      let result = fresh ctx "neg" in
-      let zero = fresh ctx "zero" in
-      emit ctx "%s = arith.constant 0 : i32" zero;
-      let zero_vec = emit_splat ctx zero "i32" in
-      emit ctx "%s = arith.subi %s, %s : %s" result zero_vec v (mlir_type t);
+          (ssa_name, t)
+      | None ->
+          let result = fresh ctx "undef" in
+          emit ctx "%s = arith.constant 0.0 : f32" result;
+          (result, Scalar SFloat))
+
+  | EBinop (l, op, r) ->
+      let (lhs, lt) = emit_expr ctx l in
+      let (rhs, rt) = emit_expr ctx r in
+      (* Handle broadcast if mixing scalar and rack *)
+      let (lhs', lt') = match (lt, rt) with
+        | (Scalar _, Rack _) -> (emit_broadcast ctx lhs lt, broadcast lt)
+        | _ -> (lhs, lt)
+      in
+      let (rhs', _rt') = match (lt, rt) with
+        | (Rack _, Scalar _) -> (emit_broadcast ctx rhs rt, broadcast rt)
+        | _ -> (rhs, rt)
+      in
+      let result = emit_binop ctx op lt' rt lhs' rhs' in
+      let result_t = match op with
+        | Lt | Le | Gt | Ge | Eq | Ne -> Mask
+        | _ -> binop_result lt' rt
+      in
+      (result, result_t)
+
+  | EUnop (op, e) ->
+      let (arg, t) = emit_expr ctx e in
+      let result = emit_unop ctx op t arg in
       (result, t)
-  | EUnop (FNeg, e) ->
-      let v, t = emit_expr ctx env e in
-      let result = fresh ctx "fneg" in
-      emit ctx "%s = arith.negf %s : %s" result v (mlir_type t);
-      (result, t)
-  | EUnop (Not, e) ->
-      let v, t = emit_expr ctx env e in
-      let result = fresh ctx "not" in
-      let ones = fresh ctx "ones" in
-      emit ctx "%s = arith.constant 1 : i1" ones;
-      let ones_vec = emit_splat ctx ones "i1" in
-      emit ctx "%s = arith.xori %s, %s : %s" result v ones_vec (mlir_type t);
-      (result, t)
-  | ECall (name, args) -> (
-      let arg_vals = List.map (emit_expr ctx env) args in
-      let result = fresh ctx "call" in
-      (* Arguments without type annotations *)
-      let args_str = String.concat ", " (List.map fst arg_vals) in
-      let arg_types_str =
-        String.concat ", " (List.map (fun (_, t) -> mlir_type t) arg_vals)
-      in
+
+  | ECall (name, args) ->
       (* Handle built-in math functions *)
-      match name with
-      | "sqrt" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.sqrt %s : %s" result v (mlir_type t);
-          (result, t)
-      | "exp" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.exp %s : %s" result v (mlir_type t);
-          (result, t)
-      | "log" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.log %s : %s" result v (mlir_type t);
-          (result, t)
-      | "sin" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.sin %s : %s" result v (mlir_type t);
-          (result, t)
-      | "cos" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.cos %s : %s" result v (mlir_type t);
-          (result, t)
-      | "abs" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.absf %s : %s" result v (mlir_type t);
-          (result, t)
-      | "floor" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.floor %s : %s" result v (mlir_type t);
-          (result, t)
-      | "ceil" ->
-          let v, t = List.hd arg_vals in
-          emit ctx "%s = math.ceil %s : %s" result v (mlir_type t);
-          (result, t)
-      | "min" when List.length arg_vals = 2 ->
-          let v1, t = List.nth arg_vals 0 in
-          let v2, _ = List.nth arg_vals 1 in
-          emit ctx "%s = arith.minimumf %s, %s : %s" result v1 v2 (mlir_type t);
-          (result, t)
-      | "max" when List.length arg_vals = 2 ->
-          let v1, t = List.nth arg_vals 0 in
-          let v2, _ = List.nth arg_vals 1 in
-          emit ctx "%s = arith.maximumf %s, %s : %s" result v1 v2 (mlir_type t);
-          (result, t)
-      | _ ->
-          (* User-defined function call *)
-          let ret_type =
-            try
-              match List.assoc name ctx.funcs with
-              | Types.Fun (_, ret) -> ret
-              | t -> t
-            with Not_found -> Types.Rack Types.SFloat
-          in
-          emit ctx "%s = func.call @%s(%s) : (%s) -> %s" result name args_str
-            arg_types_str (mlir_type ret_type);
-          (result, ret_type))
-  | ELet (b, body) ->
-      let v, t = emit_expr ctx env b.bind_expr in
-      (* In SSA form, map the binding name to the computed value *)
-      Hashtbl.add env b.bind_name t;
-      ctx.values <- (b.bind_name, v) :: ctx.values;
-      emit ctx "// let %s = %s" b.bind_name v;
-      emit_expr ctx env body
-  | EFun (_params, body) ->
-      (* Lambda - just emit the body for now *)
-      emit_expr ctx env body
-  | ERails rails -> emit_rails ctx env rails
-  | ELanes ->
-      let result = fresh ctx "lanes" in
-      emit ctx "%s = arith.constant %d : i32" result vector_width;
-      (result, Types.Scalar Types.SInt)
+      let emit_math_call fname arg =
+        let result = fresh ctx "r" in
+        emit ctx "%s = math.%s %s : %s" result fname arg vec_f32;
+        (result, Rack SFloat)
+      in
+      (match (name, args) with
+       | ("sqrt", [e]) ->
+           let (arg, _) = emit_expr ctx e in
+           emit_math_call "sqrt" arg
+       | ("sin", [e]) ->
+           let (arg, _) = emit_expr ctx e in
+           emit_math_call "sin" arg
+       | ("cos", [e]) ->
+           let (arg, _) = emit_expr ctx e in
+           emit_math_call "cos" arg
+       | ("abs", [e]) ->
+           let (arg, _) = emit_expr ctx e in
+           emit_math_call "absf" arg
+       | _ ->
+           (* User-defined function call *)
+           let arg_results = List.map (emit_expr ctx) args in
+           let arg_vals = List.map fst arg_results in
+           let arg_types = List.map (fun (_, t) -> mlir_type t) arg_results in
+           let result = fresh ctx "call" in
+           emit ctx "%s = call @%s(%s) : (%s) -> %s"
+             result name
+             (String.concat ", " arg_vals)
+             (String.concat ", " arg_types)
+             vec_f32;
+           (result, Rack SFloat))
+
+  | EField (e, field) ->
+      let (base, t) = emit_expr ctx e in
+      (* For now, assume fields are stored as separate variables *)
+      let field_var = base ^ "_" ^ field in
+      (match Hashtbl.find_opt ctx.vars field_var with
+       | Some ssa -> (ssa, get_field_type t field)
+       | None ->
+           (* Create a placeholder - real implementation would extract from struct *)
+           let result = fresh ctx field in
+           emit ctx "// Field access: %s.%s" base field;
+           (result, get_field_type t field))
+
+  | EBroadcast e ->
+      let (val_, t) = emit_expr ctx e in
+      let result = emit_broadcast ctx val_ t in
+      (result, broadcast t)
+
+  | EReduce (op, e) ->
+      let (arg, _) = emit_expr ctx e in
+      let result = fresh ctx "red" in
+      let op_name = match op with
+        | RAdd -> "add"
+        | RMul -> "mul"
+        | RMin -> "minimumf"
+        | RMax -> "maximumf"
+        | _ -> "add"
+      in
+      emit ctx "%s = vector.reduction <%s>, %s : %s into f32"
+        result op_name arg vec_f32;
+      (result, Scalar SFloat)
+
   | ELaneIndex ->
       let result = fresh ctx "idx" in
       emit ctx "%s = vector.step : vector<%dxi32>" result vector_width;
-      (result, Types.Rack Types.SInt)
-  | EReduce (op, e) ->
-      let v, _t = emit_expr ctx env e in
-      let result = fresh ctx "reduce" in
-      let reduction =
-        match op with
-        | RAdd -> "vector.reduction <add>"
-        | RMul -> "vector.reduction <mul>"
-        | RMin -> "vector.reduction <minimumf>"
-        | RMax -> "vector.reduction <maximumf>"
-        | RAnd -> "vector.reduction <and>"
-        | ROr -> "vector.reduction <or>"
-      in
-      emit ctx "%s = %s, %s : vector<%dxf32> into f32" result reduction v
-        vector_width;
-      (result, Types.Scalar Types.SFloat)
-  | EBroadcast e -> (
-      let v, t = emit_expr ctx env e in
-      (* If already a vector, return as-is *)
-      match t with
-      | Types.Scalar s ->
-          let vec = emit_splat ctx v (mlir_scalar_type s) in
-          (vec, Types.Rack s)
-      | _ -> (v, t))
-  | ERetire ->
-      emit ctx "// retire - lane mask update";
-      ("", Types.Unit)
-  | EPipe (e1, e2) ->
-      (* Pipeline fusion: transform x |> f(args) into f(x, args) *)
-      emit ctx "// Pipeline fusion";
-      emit_pipe_fused ctx env e1 e2
-  | EField (e, field) -> (
-      (* Field access - emit struct access *)
-      let v, t = emit_expr ctx env e in
-      emit ctx "// field access .%s on %s" field v;
-      let result = fresh ctx "field" in
-      match t with
-      | Types.Pack (_, fields) | Types.Aos (_, fields) | Types.Single (_, fields)
-        ->
-          (* Struct field access - look up field type *)
-          let rec find_field_idx idx = function
-            | [] -> (0, Types.Rack Types.SFloat)
-            | (name, ft) :: rest ->
-                if name = field then (idx, ft)
-                else find_field_idx (idx + 1) rest
-          in
-          let idx, field_type = find_field_idx 0 fields in
-          let op_name =
-            match t with
-            | Types.Pack _ -> "racks.soa_field"
-            | Types.Aos _ -> "racks.aos_field"
-            | Types.Single _ -> "racks.single_field"
-            | _ -> "racks.field"
-          in
-          emit ctx "%s = %s %s[%d] : %s -> %s" result op_name v idx
-            (mlir_type t) (mlir_type field_type);
-          (result, field_type)
-      | Types.CompoundRack c ->
-          (* Built-in vector component access (.x, .y, .z, .w) *)
-          let idx =
-            match field with
-            | "x" -> 0
-            | "y" -> 1
-            | "z" -> 2
-            | "w" -> 3
-            | _ -> 0
-          in
-          let max_idx =
-            match c with
-            | Types.CVec2 -> 1
-            | Types.CVec3 -> 2
-            | Types.CVec4 -> 3
-            | _ -> 3
-          in
-          let idx = min idx max_idx in
-          emit ctx "%s = vector.extract %s[%d] : %s" result v idx (mlir_type t);
-          (result, Types.Rack Types.SFloat)
-      | Types.CompoundScalar c ->
-          let idx =
-            match field with
-            | "x" -> 0
-            | "y" -> 1
-            | "z" -> 2
-            | "w" -> 3
-            | _ -> 0
-          in
-          let max_idx =
-            match c with
-            | Types.CVec2 -> 1
-            | Types.CVec3 -> 2
-            | Types.CVec4 -> 3
-            | _ -> 3
-          in
-          let idx = min idx max_idx in
-          emit ctx "%s = llvm.extractvalue %s[%d] : %s" result v idx
-            (mlir_type t);
-          (result, Types.Scalar Types.SFloat)
-      | _ ->
-          emit ctx "// field access on unsupported type %s" (Types.show t);
-          emit ctx "%s = arith.constant 0.0 : f32" result;
-          let vec = emit_splat ctx result "f32" in
-          (vec, Types.Rack Types.SFloat))
+      (result, Rack SInt)
+
+  | ELanes ->
+      let result = fresh ctx "w" in
+      emit ctx "%s = arith.constant %d : i32" result vector_width;
+      (result, Scalar SInt)
+
+  | ERecord (name, inits) ->
+      (* For now, emit each field as a separate value and create a tuple *)
+      let field_vals = List.map (fun init ->
+        let (v, _) = emit_expr ctx init.init_value in
+        v
+      ) inits in
+      let result = fresh ctx "rec" in
+      emit ctx "// Record %s: %s" name (String.concat ", " field_vals);
+      (* Store fields for later access *)
+      List.iter2 (fun init v ->
+        Hashtbl.add ctx.vars (result ^ "_" ^ init.init_field) v
+      ) inits field_vals;
+      (result, match Hashtbl.find_opt ctx.types name with
+       | Some t -> t
+       | None -> Unknown)
+
+  | ETuple es ->
+      let vals = List.map (fun e -> emit_expr ctx e) es in
+      let result = fresh ctx "tup" in
+      emit ctx "// Tuple: %s" (String.concat ", " (List.map fst vals));
+      (result, Tuple (List.map snd vals))
+
+  | EUnit -> ("%unit", Unit)
+
+  | ELet (binding, body) ->
+      let (v, t) = emit_expr ctx binding.bind_expr in
+      Hashtbl.add ctx.vars binding.bind_name v;
+      Hashtbl.add ctx.type_env.vars binding.bind_name t;
+      emit_expr ctx body
+
   | _ ->
-      emit ctx "// unimplemented expression";
-      let r = fresh ctx "undef" in
-      emit ctx "%s = arith.constant 0.0 : f32" r;
-      let vec = emit_splat ctx r "f32" in
-      (vec, Types.Unknown)
+      (* Fallback for unhandled expressions *)
+      let result = fresh ctx "todo" in
+      emit ctx "%s = arith.constant dense<0.0> : %s" result vec_f32;
+      (result, Rack SFloat)
 
-(* Pipeline fusion - the key optimization for rake performance *)
-(* Transforms: x |> f |> g |> h into nested inlined calls *)
-and emit_pipe_fused ctx env e1 e2 =
-  (* First, collect the entire pipeline chain *)
-  let rec collect_chain expr acc =
-    match expr.v with
-    | EPipe (left, right) -> collect_chain left (right :: acc)
-    | _ -> (expr, acc)
-  in
-  let base_expr, chain = collect_chain e1 [ e2 ] in
+and get_field_type t field =
+  match t with
+  | Stack (_, fields) | Single (_, fields) -> (
+      match List.assoc_opt field fields with
+      | Some ft -> ft
+      | None -> Rack SFloat)
+  | _ -> Rack SFloat
 
-  (* Emit the base expression *)
-  let base_val, base_type = emit_expr ctx env base_expr in
-  emit ctx "// Pipeline chain: %d stages" (List.length chain);
+(** Emit a statement *)
+let emit_stmt ctx (stmt: Ast.stmt) =
+  match stmt.v with
+  | SLet binding ->
+      let (v, t) = emit_expr ctx binding.bind_expr in
+      Hashtbl.add ctx.vars binding.bind_name v;
+      Hashtbl.add ctx.type_env.vars binding.bind_name t
 
-  (* Process each stage in the chain, threading the value through *)
-  let rec process_chain current_val current_type = function
-    | [] -> (current_val, current_type)
-    | stage :: rest ->
-        let stage_val, stage_type =
-          emit_pipe_stage ctx env current_val current_type stage
-        in
-        process_chain stage_val stage_type rest
-  in
-  process_chain base_val base_type chain
+  | SAssign (name, e) ->
+      let (v, _) = emit_expr ctx e in
+      Hashtbl.replace ctx.vars name v
 
-(* Emit a single pipeline stage - fuses the piped value into the call *)
-and emit_pipe_stage ctx env piped_val piped_type stage =
-  match stage.v with
-  | ECall (name, args) -> (
-      (* Key fusion: x |> f(a, b) becomes f(x, a, b) *)
-      emit ctx "// Fused: %s piped into %s()" piped_val name;
+  | SExpr e ->
+      ignore (emit_expr ctx e)
 
-      (* Emit argument values *)
-      let arg_vals = List.map (emit_expr ctx env) args in
+(** Emit predicate, return SSA name of mask *)
+let rec emit_predicate ctx (pred: Ast.predicate) : string =
+  match pred.v with
+  | PExpr e ->
+      fst (emit_expr ctx e)
 
-      (* Build fused argument list: piped value first, then explicit args *)
-      let all_args = (piped_val, piped_type) :: arg_vals in
-      let args_str = String.concat ", " (List.map fst all_args) in
-      let arg_types_str =
-        String.concat ", " (List.map (fun (_, t) -> mlir_type t) all_args)
-      in
-
-      let result = fresh ctx "fused" in
-
-      (* Handle built-in functions with piped argument *)
-      match name with
-      | "sqrt" ->
-          emit ctx "%s = math.sqrt %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "exp" ->
-          emit ctx "%s = math.exp %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "log" ->
-          emit ctx "%s = math.log %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "sin" ->
-          emit ctx "%s = math.sin %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "cos" ->
-          emit ctx "%s = math.cos %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "abs" ->
-          emit ctx "%s = math.absf %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "floor" ->
-          emit ctx "%s = math.floor %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "ceil" ->
-          emit ctx "%s = math.ceil %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "min" when List.length args = 1 ->
-          let v2, _ = List.hd arg_vals in
-          emit ctx "%s = arith.minimumf %s, %s : %s" result piped_val v2
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "max" when List.length args = 1 ->
-          let v2, _ = List.hd arg_vals in
-          emit ctx "%s = arith.maximumf %s, %s : %s" result piped_val v2
-            (mlir_type piped_type);
-          (result, piped_type)
-      | _ ->
-          (* User-defined function - emit fused call *)
-          let ret_type =
-            try
-              match List.assoc name ctx.funcs with
-              | Types.Fun (_, ret) -> ret
-              | t -> t
-            with Not_found -> piped_type (* Assume same type if unknown *)
-          in
-          emit ctx "%s = func.call @%s(%s) : (%s) -> %s" result name args_str
-            arg_types_str (mlir_type ret_type);
-          (result, ret_type))
-  | EVar name -> (
-      (* x |> f where f is a function name - becomes f(x) *)
-      emit ctx "// Fused: %s piped into function %s" piped_val name;
-      let result = fresh ctx "fused" in
-
-      (* Handle built-in unary functions *)
-      match name with
-      | "sqrt" ->
-          emit ctx "%s = math.sqrt %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "exp" ->
-          emit ctx "%s = math.exp %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "log" ->
-          emit ctx "%s = math.log %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "sin" ->
-          emit ctx "%s = math.sin %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "cos" ->
-          emit ctx "%s = math.cos %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "abs" ->
-          emit ctx "%s = math.absf %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "floor" ->
-          emit ctx "%s = math.floor %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | "ceil" ->
-          emit ctx "%s = math.ceil %s : %s" result piped_val
-            (mlir_type piped_type);
-          (result, piped_type)
-      | _ ->
-          (* User-defined function *)
-          let ret_type =
-            try
-              match List.assoc name ctx.funcs with
-              | Types.Fun (_, ret) -> ret
-              | t -> t
-            with Not_found -> piped_type
-          in
-          emit ctx "%s = func.call @%s(%s) : (%s) -> %s" result name piped_val
-            (mlir_type piped_type) (mlir_type ret_type);
-          (result, ret_type))
-  | EFun (params, body) -> (
-      (* x |> fun y -> expr  - inline the lambda *)
-      emit ctx "// Fused: inline lambda";
-      (* Bind the piped value to the first parameter *)
-      match params with
-      | PVar (param_name, _) :: _ | PScalar (param_name, _) :: _ ->
-          Hashtbl.add env param_name piped_type;
-          ctx.values <- (param_name, piped_val) :: ctx.values;
-          emit_expr ctx env body
-      | [] -> emit_expr ctx env body)
-  | EBinop (_, op, _) ->
-      (* x |> (+ y) - partial application, emit the binop *)
-      let rv, _rt = emit_expr ctx env stage in
-      let is_float =
-        match piped_type with
-        | Types.Rack Types.SFloat | Types.Rack Types.SDouble -> true
-        | _ -> false
-      in
-      let result =
-        emit_binop ctx is_float op piped_val rv (mlir_type piped_type)
-      in
-      ( result,
-        if op = Lt || op = Le || op = Gt || op = Ge || op = Eq || op = Ne then
-          Types.Mask
-        else piped_type )
-  | _ ->
-      (* Fallback: evaluate stage and combine *)
-      emit ctx "// Pipeline stage fallback";
-      emit_expr ctx env stage
-
-(* Emit rails as nested selects *)
-and emit_rails ctx env rails =
-  match rails with
-  | [] -> ("", Types.Unit)
-  | [ r ] ->
-      (* Single rail - just emit body *)
-      emit_expr ctx env r.v.rail_body
-  | _ ->
-      (* Multiple rails - chain of selects *)
-      (* Strategy: evaluate all, then select from last to first *)
-      (* Last rail (usually "otherwise") is the default, then we wrap conditionals *)
-      let rail_data =
-        List.map
-          (fun r ->
-            let mask, _ = emit_rail_cond ctx env r.v.rail_cond in
-            let body_val, body_type = emit_expr ctx env r.v.rail_body in
-            (r.v.rail_cond, mask, body_val, body_type))
-          rails
-      in
-
-      (* Build selection chain: start from last (default), wrap with earlier conditions *)
-      let rec build_select = function
-        | [] -> ("", Types.Unit)
-        | [ (_, _, val_, typ) ] ->
-            (val_, typ) (* Base case: otherwise/last rail *)
-        | (cond, mask, val_, typ) :: rest -> (
-            let rest_val, _ = build_select rest in
-            (* For "otherwise", just use the value directly *)
-            match cond with
-            | RCOtherwise -> (val_, typ)
-            | _ ->
-                let result = fresh ctx "sel" in
-                emit ctx "%s = arith.select %s, %s, %s : %s, %s" result mask
-                  val_ rest_val (mlir_type Types.Mask) (mlir_type typ);
-                (result, typ))
-      in
-      build_select rail_data
-
-and emit_rail_cond ctx env = function
-  | RCNamed (_name, pred) -> emit_pred ctx env pred
-  | RCAnon pred -> emit_pred ctx env pred
-  | RCOtherwise ->
-      (* All lanes active *)
-      let c = fresh ctx "true" in
-      emit ctx "%s = arith.constant 1 : i1" c;
-      let vec = emit_splat ctx c "i1" in
-      (vec, Types.Mask)
-  | RCRef name -> (sprintf "%%%s" name, Types.Mask)
-
-and emit_pred ctx env (p : predicate) : string * Types.t =
-  match p.v with
-  | PExpr e -> emit_expr ctx env e
-  | PIs (l, r) ->
-      let lv, lt = emit_expr ctx env l in
-      let rv, rt = emit_expr ctx env r in
-      let is_float =
-        match (lt, rt) with
-        | Types.Rack Types.SFloat, _
-        | _, Types.Rack Types.SFloat
-        | Types.Rack Types.SDouble, _
-        | _, Types.Rack Types.SDouble ->
-            true
-        | _ -> false
-      in
-      let rv =
-        if
-          is_float && match rt with Types.Rack Types.SInt -> true | _ -> false
-        then (
-          let conv = fresh ctx "sitofp" in
-          emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-            conv rv vector_width vector_width;
-          conv)
-        else rv
-      in
-      let result = emit_cmp ctx is_float Eq lv rv (mlir_type lt) in
-      (result, Types.Mask)
-  | PIsNot (l, r) ->
-      let lv, lt = emit_expr ctx env l in
-      let rv, rt = emit_expr ctx env r in
-      let is_float =
-        match (lt, rt) with
-        | Types.Rack Types.SFloat, _
-        | _, Types.Rack Types.SFloat
-        | Types.Rack Types.SDouble, _
-        | _, Types.Rack Types.SDouble ->
-            true
-        | _ -> false
-      in
-      let rv =
-        if
-          is_float && match rt with Types.Rack Types.SInt -> true | _ -> false
-        then (
-          let conv = fresh ctx "sitofp" in
-          emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-            conv rv vector_width vector_width;
-          conv)
-        else rv
-      in
-      let result = emit_cmp ctx is_float Ne lv rv (mlir_type lt) in
-      (result, Types.Mask)
   | PCmp (l, op, r) ->
-      let lv, lt = emit_expr ctx env l in
-      let rv, rt = emit_expr ctx env r in
-      (* Type coercion for mixed int/float comparisons *)
-      let is_float_l =
-        match lt with
-        | Types.Rack Types.SFloat | Types.Rack Types.SDouble -> true
-        | _ -> false
+      let (lhs, lt) = emit_expr ctx l in
+      let (rhs, rt) = emit_expr ctx r in
+      (* Handle broadcast if needed *)
+      let (lhs', rhs') = match (lt, rt) with
+        | (Scalar _, Rack _) -> (emit_broadcast ctx lhs lt, rhs)
+        | (Rack _, Scalar _) -> (lhs, emit_broadcast ctx rhs rt)
+        | _ -> (lhs, rhs)
       in
-      let is_float_r =
-        match rt with
-        | Types.Rack Types.SFloat | Types.Rack Types.SDouble -> true
-        | _ -> false
+      let result = fresh ctx "cmp" in
+      let op_str = match op with
+        | CLt -> "olt" | CLe -> "ole" | CGt -> "ogt"
+        | CGe -> "oge" | CEq -> "oeq" | CNe -> "one"
       in
-      let is_float = is_float_l || is_float_r in
-      let lv, lt =
-        if is_float && not is_float_l then (
-          let conv = fresh ctx "sitofp" in
-          emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-            conv lv vector_width vector_width;
-          (conv, Types.Rack Types.SFloat))
-        else (lv, lt)
-      in
-      let rv =
-        if is_float && not is_float_r then (
-          let conv = fresh ctx "sitofp" in
-          emit ctx "%s = arith.sitofp %s : vector<%dxi32> to vector<%dxf32>"
-            conv rv vector_width vector_width;
-          conv)
-        else rv
-      in
-      let ast_op =
-        match op with CLt -> Lt | CLe -> Le | CGt -> Gt | CGe -> Ge
-      in
-      let result = emit_cmp ctx is_float ast_op lv rv (mlir_type lt) in
-      (result, Types.Mask)
+      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result op_str lhs' rhs' vec_f32;
+      result
+
+  | PIs (l, r) | PIsNot (l, r) ->
+      let (lhs, _) = emit_expr ctx l in
+      let (rhs, _) = emit_expr ctx r in
+      let result = fresh ctx "is" in
+      let cmp = match pred.v with PIs _ -> "oeq" | _ -> "one" in
+      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result cmp lhs rhs vec_f32;
+      result
+
   | PAnd (l, r) ->
-      let lv, _ = emit_pred ctx env l in
-      let rv, _ = emit_pred ctx env r in
+      let lm = emit_predicate ctx l in
+      let rm = emit_predicate ctx r in
       let result = fresh ctx "and" in
-      emit ctx "%s = arith.andi %s, %s : vector<%dxi1>" result lv rv
-        vector_width;
-      (result, Types.Mask)
+      emit ctx "%s = arith.andi %s, %s : %s" result lm rm vec_i1;
+      result
+
   | POr (l, r) ->
-      let lv, _ = emit_pred ctx env l in
-      let rv, _ = emit_pred ctx env r in
+      let lm = emit_predicate ctx l in
+      let rm = emit_predicate ctx r in
       let result = fresh ctx "or" in
-      emit ctx "%s = arith.ori %s, %s : vector<%dxi1>" result lv rv vector_width;
-      (result, Types.Mask)
+      emit ctx "%s = arith.ori %s, %s : %s" result lm rm vec_i1;
+      result
+
   | PNot p ->
-      let v, _ = emit_pred ctx env p in
+      let m = emit_predicate ctx p in
+      let ones = fresh ctx "ones" in
       let result = fresh ctx "not" in
-      let c = fresh ctx "ones" in
-      emit ctx "%s = arith.constant 1 : i1" c;
-      let ones = emit_splat ctx c "i1" in
-      emit ctx "%s = arith.xori %s, %s : vector<%dxi1>" result v ones
-        vector_width;
-      (result, Types.Mask)
+      emit ctx "%s = arith.constant dense<true> : %s" ones vec_i1;
+      emit ctx "%s = arith.xori %s, %s : %s" result m ones vec_i1;
+      result
 
-(* Emit a function definition *)
-let emit_func ctx check_env name sig_ body is_rake =
-  let ret_type = Check.check_type check_env sig_.sig_return in
+  | PTineRef name -> (
+      match Hashtbl.find_opt ctx.tines name with
+      | Some ssa -> ssa
+      | None -> failwith ("Reference to undefined tine: " ^ name))
 
-  (* Extract parameter names from body *)
-  let body_params = match body.v with EFun (params, _) -> params | _ -> [] in
+(** Emit tine declaration *)
+let emit_tine ctx (tine: Ast.tine) =
+  let mask = emit_predicate ctx tine.tine_pred in
+  Hashtbl.add ctx.tines tine.tine_name mask;
+  emit ctx "// Tine #%s = %s" tine.tine_name mask
 
-  (* Build parameter list with actual names *)
-  let params =
-    List.mapi
-      (fun i (_, typ) ->
-        let param_type = Check.check_type check_env typ in
-        let param_name =
-          match List.nth_opt body_params i with
-          | Some (PVar (n, _)) -> n
-          | Some (PScalar (n, _)) -> n
-          | None -> sprintf "arg%d" i
-        in
-        (param_name, param_type))
-      sig_.sig_params
+(** Emit through block *)
+let emit_through ctx (th: Ast.through) =
+  (* Get the mask for this through block *)
+  let mask = match th.through_tine with
+    | TRSingle name -> (
+        match Hashtbl.find_opt ctx.tines name with
+        | Some m -> m
+        | None -> failwith ("Through references undefined tine: " ^ name))
+    | TRComposed pred -> emit_predicate ctx pred
   in
 
-  let params_str =
-    String.concat ", "
-      (List.map (fun (n, t) -> sprintf "%%%s: %s" n (mlir_type t)) params)
+  (* Emit passthru value if present, otherwise use zero *)
+  let passthru = match th.through_passthru with
+    | Some e -> fst (emit_expr ctx e)
+    | None ->
+        let z = fresh ctx "zero" in
+        emit ctx "%s = arith.constant dense<0.0> : %s" z vec_f32;
+        z
   in
 
-  emit ctx "";
-  emit ctx "// %s function: %s" (if is_rake then "rake" else "crunch") name;
-  emit ctx "func.func @%s(%s) -> %s {" name params_str (mlir_type ret_type);
+  (* Emit body statements *)
+  List.iter (emit_stmt ctx) th.through_body;
+
+  (* Emit result expression *)
+  let (result_val, result_t) = emit_expr ctx th.through_result in
+
+  (* Use vector.mask to apply the mask *)
+  let masked = fresh ctx "masked" in
+  let result_type = mlir_type result_t in
+  emit ctx "%s = arith.select %s, %s, %s : %s, %s"
+    masked mask result_val passthru vec_i1 result_type;
+
+  (* Store the result binding *)
+  Hashtbl.add ctx.vars th.through_binding masked;
+  Hashtbl.add ctx.type_env.vars th.through_binding result_t;
+  emit ctx "// Through -> %s = %s" th.through_binding masked
+
+(** Emit sweep block *)
+let emit_sweep ctx (sw: Ast.sweep) =
+  (* Build nested select chain from last to first *)
+  let rec build_select arms acc =
+    match arms with
+    | [] -> acc
+    | arm :: rest ->
+        let (val_, _) = emit_expr ctx arm.arm_value in
+        let result = fresh ctx "sel" in
+        (match arm.arm_tine with
+         | Some name -> (
+             match Hashtbl.find_opt ctx.tines name with
+             | Some mask ->
+                 emit ctx "%s = arith.select %s, %s, %s : %s, %s"
+                   result mask val_ acc vec_i1 vec_f32;
+                 build_select rest result
+             | None ->
+                 build_select rest val_)
+         | None ->
+             (* Catch-all: use this value as default *)
+             build_select rest val_)
+  in
+  (* Start with undefined/zero and build up *)
+  let init = fresh ctx "undef" in
+  emit ctx "%s = arith.constant dense<0.0> : %s" init vec_f32;
+  let result = build_select (List.rev sw.sweep_arms) init in
+  Hashtbl.add ctx.vars sw.sweep_binding result;
+  emit ctx "// Sweep -> %s = %s" sw.sweep_binding result;
+  result
+
+(** Emit crunch function *)
+let emit_crunch ctx name params _result body =
+  (* Function signature *)
+  let param_strs = List.mapi (fun i p ->
+    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
+    let pty = vec_f32 in  (* TODO: proper type *)
+    Hashtbl.add ctx.vars pname (Printf.sprintf "%%arg%d" i);
+    Printf.sprintf "%%arg%d: %s" i pty
+  ) params in
+
+  emit ctx "func.func @%s(%s) -> %s {" name (String.concat ", " param_strs) vec_f32;
   ctx.indent <- ctx.indent + 1;
 
-  (* Reset value mappings for new function scope *)
-  ctx.values <- [];
+  (* Emit body *)
+  List.iter (emit_stmt ctx) body;
 
-  (* Create local environment with parameters *)
-  let local_env = Hashtbl.create 16 in
-  List.iter (fun (n, t) -> Hashtbl.add local_env n t) params;
+  (* Find result variable and return it *)
+  let ret_val = match Hashtbl.find_opt ctx.vars _result.result_name with
+    | Some v -> v
+    | None -> "%arg0"
+  in
+  emit ctx "func.return %s : %s" ret_val vec_f32;
 
-  (* Get actual body (unwrap EFun) *)
-  let actual_body = match body.v with EFun (_, b) -> b | _ -> body in
-
-  let result, _ = emit_expr ctx local_env actual_body in
-  emit ctx "func.return %s : %s" result (mlir_type ret_type);
   ctx.indent <- ctx.indent - 1;
-  emit ctx "}";
+  emit ctx "}"
 
-  (* Record function for call resolution *)
-  ctx.funcs <- (name, Types.Fun (List.map snd params, ret_type)) :: ctx.funcs
-
-(* Emit SoA struct type definition *)
-let emit_soa_type ctx name fields check_env =
-  emit ctx "";
-  emit ctx "// SoA type: %s" name;
-  emit ctx "// Each field is a vector of %d elements" vector_width;
-  let field_types =
-    List.map
-      (fun f ->
-        let t = Check.check_type check_env f.field_type in
-        sprintf "%s: %s" f.field_name (mlir_type t))
-      fields
-  in
-  emit ctx "// !rake.soa_%s = { %s }" name (String.concat ", " field_types)
-
-(* Emit a definition *)
-let emit_def ctx check_env (d : def) =
-  match d.v with
-  | DSoa (name, fields) -> emit_soa_type ctx name fields check_env
-  | DAos (name, _fields) ->
-      emit ctx "";
-      emit ctx "// AoS type: %s" name
-  | DSingle (name, _fields) ->
-      emit ctx "";
-      emit ctx "// Single type: %s" name
-  | DType (name, _t) ->
-      emit ctx "";
-      emit ctx "// Type alias: %s" name
-  | DCrunch (name, sig_, body) -> emit_func ctx check_env name sig_ body false
-  | DRake (name, sig_, body) -> emit_func ctx check_env name sig_ body true
-  | DRun (name, _sig_, _body) ->
-      emit ctx "";
-      emit ctx "// Run block: %s (sequential, not yet implemented)" name
-
-(* Main entry point *)
-let emit_program (check_env : Check.env) (p : program) : string =
-  let ctx =
-    {
-      buf = Buffer.create 8192;
-      counter = 0;
-      indent = 0;
-      funcs = [];
-      values = [];
-    }
+(** Emit rake function *)
+let emit_rake ctx name params _result setup tines throughs sweep =
+  (* Compute result type *)
+  let result_type = match Typecheck.find_type ctx.type_env _result.result_name with
+    | Some t -> mlir_type t
+    | None -> vec_f32
   in
 
-  (* Header *)
-  emit ctx "// rake Language - Generated MLIR";
-  emit ctx "// Target: %d-wide vectors (AVX2)" vector_width;
-  emit ctx "// Dialects: func, arith, vector, scf";
-  emit ctx "";
+  (* Function signature *)
+  let param_strs = List.mapi (fun i p ->
+    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
+    let is_scalar = match p with PScalar _ -> true | _ -> false in
+    let pty = if is_scalar then "f32" else vec_f32 in
+    let arg = Printf.sprintf "%%arg%d" i in
+    Hashtbl.add ctx.vars pname arg;
+    Hashtbl.add ctx.type_env.vars pname
+      (if is_scalar then Scalar SFloat else Rack SFloat);
+    Printf.sprintf "%s: %s" arg pty
+  ) params in
+
+  emit ctx "func.func @%s(%s) -> %s {" name (String.concat ", " param_strs) result_type;
+  ctx.indent <- ctx.indent + 1;
+
+  (* Emit setup statements *)
+  List.iter (emit_stmt ctx) setup;
+
+  (* Emit tine declarations *)
+  List.iter (emit_tine ctx) tines;
+
+  (* Emit through blocks *)
+  List.iter (emit_through ctx) throughs;
+
+  (* Emit sweep *)
+  let result = emit_sweep ctx sweep in
+
+  emit ctx "func.return %s : %s" result result_type;
+
+  ctx.indent <- ctx.indent - 1;
+  emit ctx "}"
+
+(** Emit a definition *)
+let emit_def ctx (def: Ast.def) =
+  match def.v with
+  | DStack (name, fields) ->
+      emit ctx "// Stack type: %s" name;
+      List.iter (fun f ->
+        emit ctx "//   %s: %s" f.field_name (show_typ_kind f.field_type.v)
+      ) fields
+
+  | DSingle (name, fields) ->
+      emit ctx "// Single type: %s" name;
+      List.iter (fun f ->
+        emit ctx "//   %s: %s" f.field_name (show_typ_kind f.field_type.v)
+      ) fields
+
+  | DType (name, ty) ->
+      emit ctx "// Type alias: %s = %s" name (show_typ_kind ty.v)
+
+  | DCrunch (name, params, result, body) ->
+      emit_crunch ctx name params result body
+
+  | DRake (name, params, result, setup, tines, throughs, sweep) ->
+      emit_rake ctx name params result setup tines throughs sweep
+
+  | DRun (name, params, result, body) ->
+      emit_crunch ctx name params result body
+
+(** Emit a module *)
+let emit_module ctx (m: Ast.module_) =
+  emit ctx "// Module: %s" m.mod_name;
+  List.iter (emit_def ctx) m.mod_defs
+
+(** Emit a program *)
+let emit_program env (prog: Ast.program) =
+  let ctx = create_ctx env in
   emit ctx "module {";
   ctx.indent <- 1;
-
-  (* Definitions *)
-  List.iter
-    (fun m ->
-      emit ctx "";
-      emit ctx "// Module: %s" m.mod_name;
-      List.iter (emit_def ctx check_env) m.mod_defs)
-    p;
-
+  List.iter (emit_module ctx) prog;
   ctx.indent <- 0;
   emit ctx "}";
-
   Buffer.contents ctx.buf
+
+(** Main entry point *)
+let emit env prog =
+  emit_program env prog

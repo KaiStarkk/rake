@@ -1,10 +1,9 @@
 (library
  (name rake)
- (public_name rake)
+ (libraries str)
  (preprocess (pps ppx_deriving.show ppx_deriving.eq)))
 
 (ocamllex lexer)
 
 (menhir
- (modules parser)
- (flags --explain --dump))
+ (modules parser))

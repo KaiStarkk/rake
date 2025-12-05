@@ -3,6 +3,7 @@
 **/build/
 *.o
 *.ll
+*.mlir
 *.s
 
 # Dune
@@ -15,3 +16,9 @@ result
 # Benchmark results (keep .gitkeep)
 bench/results/*.json
 bench/results/*.html
+
+# Rust analyzer
+target/
+
+# Tree-sitter (subproject)
+tree-sitter-rake/

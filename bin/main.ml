@@ -1,114 +1,109 @@
-(* Rake compiler main entry point *)
+(** Rake 0.2.0 Compiler
 
-let usage = "Usage: rakec [options] <source.rk>"
-let input_file = ref None
-let output_file = ref None
+    Command-line interface for the rake compiler.
+*)
 
-(* Delete, never used?: let _dump_tokens = ref false *)
-let dump_ast = ref false
-let dump_types = ref false
-let target = ref "avx2"
-let emit_llvm = ref false
+let usage = {|
+rake - vector-first language for CPU SIMD
 
-let specs =
-  Arg.
-    [
-      ("-o", String (fun s -> output_file := Some s), "Output file");
-      ("--dump-ast", Set dump_ast, "Dump AST and exit");
-      ("--dump-types", Set dump_types, "Dump types after checking");
-      ("--target", Set_string target, "Target (avx2, avx512, neon)");
-      ("--llvm", Set emit_llvm, "Emit LLVM IR instead of MLIR");
-    ]
+Usage:
+  rake <file.rk>              Parse and type-check
+  rake --emit-ast <file.rk>   Emit AST (for debugging)
+  rake --emit-mlir <file.rk>  Emit MLIR
+  rake --version              Show version
+  rake --help                 Show this help
 
-let anon_fun filename =
-  match !input_file with
-  | None -> input_file := Some filename
-  | Some _ -> raise (Arg.Bad "Multiple input files not supported")
+Options:
+  --width <n>    Vector width (default: 8 for AVX2)
+  --output <f>   Output file (default: stdout)
+|}
 
-let read_file filename =
+let version = "rake 0.2.0"
+
+let parse_file filename =
   let ic = open_in filename in
-  let n = in_channel_length ic in
-  let s = really_input_string ic n in
-  close_in ic;
-  s
+  let lexbuf = Lexing.from_channel ic in
+  lexbuf.Lexing.lex_curr_p <- {
+    lexbuf.Lexing.lex_curr_p with
+    Lexing.pos_fname = filename;
+  };
+  try
+    let program = Rake.Parser.program Rake.Lexer.token lexbuf in
+    close_in ic;
+    Ok program
+  with
+  | Rake.Lexer.LexError (msg, pos) ->
+      close_in ic;
+      Error (Printf.sprintf "%s:%d:%d: Lexical error: %s"
+        pos.Lexing.pos_fname
+        pos.Lexing.pos_lnum
+        (pos.Lexing.pos_cnum - pos.Lexing.pos_bol)
+        msg)
+  | Rake.Parser.Error ->
+      close_in ic;
+      let pos = lexbuf.Lexing.lex_curr_p in
+      Error (Printf.sprintf "%s:%d:%d: Syntax error"
+        pos.Lexing.pos_fname
+        pos.Lexing.pos_lnum
+        (pos.Lexing.pos_cnum - pos.Lexing.pos_bol))
 
-let write_file filename content =
-  let oc = open_out filename in
-  output_string oc content;
-  close_out oc
+let emit_ast program =
+  Rake.Ast.show_program program
+
+let emit_mlir env program =
+  Rake.Mlir.emit env program
 
 let () =
-  Arg.parse specs anon_fun usage;
+  let args = Array.to_list Sys.argv |> List.tl in
 
-  match !input_file with
-  | None ->
-      prerr_endline "Error: No input file";
-      prerr_endline usage;
-      exit 1
-  | Some filename ->
-      let source = read_file filename in
-      let lexbuf = Lexing.from_string source in
-      lexbuf.Lexing.lex_curr_p <-
-        { lexbuf.Lexing.lex_curr_p with Lexing.pos_fname = filename };
+  let process_args = function
+    | [] ->
+        print_endline usage
 
-      (* Parse *)
-      let ast =
-        try Rake.Parser.program Rake.Lexer.token lexbuf with
-        | Rake.Parser.Error ->
-            let pos = lexbuf.Lexing.lex_curr_p in
-            Printf.eprintf "Parse error at %s:%d:%d\n" pos.Lexing.pos_fname
-              pos.Lexing.pos_lnum
-              (pos.Lexing.pos_cnum - pos.Lexing.pos_bol);
-            exit 1
-        | Rake.Lexer.Error (msg, pos) ->
-            Printf.eprintf "Lexical error at %s:%d:%d: %s\n"
-              pos.Lexing.pos_fname pos.Lexing.pos_lnum
-              (pos.Lexing.pos_cnum - pos.Lexing.pos_bol)
-              msg;
-            exit 1
-      in
+    | ["--version"] ->
+        print_endline version
 
-      if !dump_ast then begin
-        Printf.printf "%s\n" (Rake.Ast.show_program ast);
-        exit 0
-      end;
+    | ["--help"] | ["-h"] ->
+        print_endline usage
 
-      (* Type check *)
-      let env =
-        match Rake.Check.check_program ast with
-        | Ok env -> env
-        | Error e ->
-            Printf.eprintf "Type error: %s\n" (Rake.Check.show_error e);
-            exit 1
-      in
+    | ["--emit-ast"; filename] -> (
+        match parse_file filename with
+        | Ok program ->
+            print_endline (emit_ast program)
+        | Error msg ->
+            prerr_endline msg;
+            exit 1)
 
-      if !dump_types then begin
-        Printf.printf "Type checking passed\n";
-        Hashtbl.iter
-          (fun name typ ->
-            Printf.printf "  %s : %s\n" name (Rake.Types.show typ))
-          env.Rake.Check.vars;
-        exit 0
-      end;
+    | ["--emit-mlir"; filename] -> (
+        match parse_file filename with
+        | Ok program -> (
+            match Rake.Typecheck.check program with
+            | Ok env ->
+                print_endline (emit_mlir env program)
+            | Error msg ->
+                prerr_endline msg;
+                exit 1)
+        | Error msg ->
+            prerr_endline msg;
+            exit 1)
 
-      (* Emit code *)
-      if !emit_llvm then begin
-        let llvm_ir = Rake.Emit.emit_program env ast in
-        let output =
-          match !output_file with
-          | Some f -> f
-          | None -> Filename.chop_extension filename ^ ".ll"
-        in
-        write_file output llvm_ir;
-        Printf.printf "Wrote LLVM IR: %s\n" output
-      end
-      else begin
-        let mlir = Rake.Mlir.emit_program env ast in
-        let output =
-          match !output_file with
-          | Some f -> f
-          | None -> Filename.chop_extension filename ^ ".mlir"
-        in
-        write_file output mlir;
-        Printf.printf "Wrote MLIR: %s\n" output
-      end
+    | [filename] when String.length filename > 3 &&
+                      String.sub filename (String.length filename - 3) 3 = ".rk" -> (
+        match parse_file filename with
+        | Ok program -> (
+            match Rake.Typecheck.check program with
+            | Ok _env ->
+                Printf.printf "Parsed and type-checked %s successfully.\n" filename
+            | Error msg ->
+                prerr_endline msg;
+                exit 1)
+        | Error msg ->
+            prerr_endline msg;
+            exit 1)
+
+    | unknown :: _ ->
+        Printf.eprintf "Unknown option or file: %s\n" unknown;
+        prerr_endline usage;
+        exit 1
+  in
+  process_args args

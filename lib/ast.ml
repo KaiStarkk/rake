@@ -1,216 +1,276 @@
-(* Rake Abstract Syntax Tree *)
+(** Rake 0.2.0 Abstract Syntax Tree
 
-(* Source locations *)
-type loc = { file : string; line : int; col : int; offset : int }
-[@@deriving show, eq]
+    Core design: Tines declare masks, Through executes under masks,
+    Sweep collects results. Data "rakes through" tine patterns.
+*)
 
-let dummy_loc = { file = ""; line = 0; col = 0; offset = 0 }
+(** Source location for error reporting *)
+type loc = {
+  file: string;
+  line: int;
+  col: int;
+  offset: int;
+}
+[@@deriving show]
 
-type 'a node = { v : 'a; loc : loc } [@@deriving show, eq]
+let dummy_loc = { file = "<none>"; line = 0; col = 0; offset = 0 }
+
+(** AST node with location *)
+type 'a node = { v: 'a; loc: loc }
+[@@deriving show]
 
 let node v loc = { v; loc }
 let node_v n = n.v
 let node_loc n = n.loc
-let dummy v = { v; loc = dummy_loc }
 
-(* Identifiers *)
-type ident = string [@@deriving show, eq]
+(** Identifiers *)
+type ident = string
+[@@deriving show]
 
-type scalar_ident = string
-(* written as <name> in source *) [@@deriving show, eq]
-
-(* Primitive types *)
+(** Primitive scalar types *)
 type prim =
-  | Float
-  | Double
-  | Int
-  | Int8
-  | Int16
-  | Int64
-  | Uint
-  | Uint8
-  | Uint16
-  | Uint64
-  | Bool
-[@@deriving show, eq]
+  | PFloat | PDouble
+  | PInt | PInt8 | PInt16 | PInt64
+  | PUint | PUint8 | PUint16 | PUint64
+  | PBool
+[@@deriving show]
 
-(* Compound vector types *)
-type compound = Vec2 | Vec3 | Vec4 | Mat3 | Mat4 [@@deriving show, eq]
+(** Compound types (vec2, vec3, etc.) *)
+type compound =
+  | CVec2 | CVec3 | CVec4
+  | CMat3 | CMat4
+[@@deriving show]
 
-(* Types *)
+(** Type expressions *)
 type typ = typ_kind node
-
 and typ_kind =
-  | TRack of prim (* float rack *)
-  | TCompoundRack of compound (* vec3 rack *)
-  | TScalar of prim (* used with <> idents *)
-  | TCompoundScalar of compound (* vec3 for single structs *)
-  | TStack of ident (* Stack type name - SoA parallel data *)
-  | TPack of typ * int option
-    (* Particles pack or pack[1000] - collection of stack chunks *)
-  | TArray of typ * int option (* Particle array or array[1000] *)
-  | TAos of ident (* aos struct name *)
-  | TSingle of ident (* single struct name *)
-  | TMask (* bool rack / rail result *)
-  | TFun of typ list * typ (* function type *)
-  | TUnit
-[@@deriving show, eq]
+  | TRack of prim                      (** float rack *)
+  | TCompoundRack of compound          (** vec3 rack *)
+  | TScalar of prim                    (** scalar float (uniform) *)
+  | TCompoundScalar of compound        (** scalar vec3 *)
+  | TStack of ident                    (** Particle stack *)
+  | TPack of ident                     (** Particle pack *)
+  | TSingle of ident                   (** Config single *)
+  | TMask                              (** boolean rack (tine result) *)
+  | TFun of typ list * typ             (** function type *)
+  | TTuple of typ list                 (** (a, b, c) *)
+  | TUnit                              (** () *)
+[@@deriving show]
 
-(* Binary operators *)
+(** Binary operators *)
 type binop =
-  | Add
-  | Sub
-  | Mul
-  | Div
-  | Mod
-  | Lt
-  | Le
-  | Gt
-  | Ge
-  | Eq
-  | Ne
-  | And
-  | Or
-  | Pipe (* |> *)
-[@@deriving show, eq]
+  (* Arithmetic *)
+  | Add | Sub | Mul | Div | Mod
+  (* Comparison (produce masks) *)
+  | Lt | Le | Gt | Ge | Eq | Ne
+  (* Logical (for masks) *)
+  | And | Or
+  (* Pipeline *)
+  | Pipe
+  (* Shifts and rotates *)
+  | Shl | Shr | Rol | Ror
+  (* Interleave *)
+  | Interleave
+[@@deriving show]
 
-(* Unary operators *)
-type unop = Neg | Not [@@deriving show, eq]
+(** Unary operators *)
+type unop =
+  | Neg     (** -x (arithmetic) *)
+  | FNeg    (** -x (floating) *)
+  | Not     (** !x (logical) *)
+[@@deriving show]
 
-(* Reduce operations *)
-type reduce_op = RAdd | RMul | RMin | RMax | RAnd | ROr [@@deriving show, eq]
+(** Reduction operators *)
+type reduceop =
+  | RAdd | RMul | RMin | RMax | RAnd | ROr
+[@@deriving show]
 
-(* Expressions *)
+(** Expressions *)
 type expr = expr_kind node
-
 and expr_kind =
   (* Literals *)
-  | EInt of int64
-  | EFloat of float
-  | EBool of bool
-  | EString of string
+  | EInt of int64                      (** 42 *)
+  | EFloat of float                    (** 3.14 *)
+  | EBool of bool                      (** true, false *)
+
   (* Variables *)
-  | EVar of ident
-  | EScalarVar of scalar_ident
+  | EVar of ident                      (** x (rack variable) *)
+  | EScalarVar of ident                (** <x> (scalar, broadcasts) *)
+
   (* Operators *)
-  | EBinop of expr * binop * expr
-  | EUnop of unop * expr
-  (* Access *)
-  | EField of expr * ident
-  | EIndex of expr * expr
-  (* Calls *)
-  | ECall of ident * expr list
-  | EPipe of expr * expr (* x |> f *)
-  (* Constructors *)
-  | ETuple of expr list
-  | ERecord of (ident * expr) list
-  | EWith of expr * (ident * expr) list (* { e with field = val } *)
+  | EBinop of expr * binop * expr      (** a + b *)
+  | EUnop of unop * expr               (** -x *)
+
+  (* Functions *)
+  | ECall of ident * expr list         (** f(a, b, c) *)
+  | ELambda of param list * expr       (** fun x y -> body *)
+  | EPipe of expr * expr               (** x |> f *)
+
   (* Bindings *)
-  | ELet of binding * expr
-  | ELetScalar of scalar_binding * expr
-  (* Lane queries *)
-  | ELanes (* lanes() *)
-  | ELaneIndex (* lane_index() *)
-  | ELead of expr (* lead(e) - first active lane's value *)
-  | ETally of expr (* tally(mask) - count active lanes *)
-  | EAny of expr (* any(mask) - true if any lane active *)
-  | EAll of expr (* all(mask) - true if all lanes active *)
-  | ENone of expr (* none(mask) - true if no lanes active *)
-  (* Reductions *)
-  | EReduce of reduce_op * expr
-  (* Memory operations *)
-  | EGather of expr * expr
-  | EScatter of expr * expr * expr
-  (* Lane manipulation *)
-  | EBroadcast of expr (* broadcast(e) - scalar to all lanes *)
-  | EShuffle of expr * expr (* shuffle(src, idx) - permute lanes *)
-  | ERotate of expr * expr (* rotate(e, n) - rotate lanes by n *)
-  | EShift of expr * expr (* shift(e, n) - shift lanes by n *)
-  | ESelect of expr * expr * expr (* select(mask, a, b) - masked selection *)
-  (* Compression and expansion *)
-  | ECompress of expr * expr (* compress(e, mask) - compact active lanes *)
-  | EExpand of expr * expr (* expand(e, mask) - inverse of compress *)
-  (* Control flow (within expressions) *)
-  | ERails of rail list
-  | ERetire (* retire - deactivate current lane *)
-  | EHalt (* halt - stop all lanes *)
+  | ELet of binding * expr             (** let x = e1 in e2 *)
 
-and binding = { bind_name : ident; bind_type : typ option; bind_expr : expr }
+  (* Records *)
+  | EField of expr * ident             (** p.pos *)
+  | ERecord of ident * field_init list (** Point { x := a, y := b } *)
+  | EWith of expr * field_init list    (** { p with x := a } *)
 
-and scalar_binding = {
-  sbind_name : scalar_ident;
-  sbind_type : typ option;
-  sbind_expr : expr;
+  (* Lane operations *)
+  | ELaneIndex                         (** @ (lane indices) *)
+  | ELanes                             (** lanes (vector width) *)
+  | EExtract of expr * expr            (** v@i (extract lane) *)
+  | EInsert of expr * expr * expr      (** v@i := x *)
+
+  (* Reductions and scans *)
+  | EReduce of reduceop * expr         (** x \+/ *)
+  | EScan of reduceop * expr           (** x \+\ *)
+
+  (* Shuffle *)
+  | EShuffle of expr * int list        (** v ~> [3,2,1,0] *)
+  | EShift of expr * int * bool        (** v >> 2, v << 2 (bool = right) *)
+  | ERotate of expr * int * bool       (** v >>> 2, v <<< 2 *)
+
+  (* Memory *)
+  | EGather of expr * expr             (** base[offsets] *)
+  | EScatter of expr * expr * expr     (** base[offsets] <- values *)
+  | ECompress of expr * expr           (** v |> compress through mask *)
+  | EExpand of expr * expr * expr      (** expand base through mask else passthru *)
+
+  (* Divergence (tines, through, sweep) *)
+  | ETines of tine list * through list * sweep
+
+  (* FMA *)
+  | EFma of expr * expr * expr         (** fma(a, b, c) *)
+
+  (* Outer product *)
+  | EOuter of expr * expr              (** a outer b *)
+
+  (* Tuple *)
+  | ETuple of expr list                (** (a, b, c) *)
+
+  (* Broadcast (explicit) *)
+  | EBroadcast of expr                 (** broadcast e *)
+
+  (* Unit *)
+  | EUnit                              (** () *)
+
+(** Parameter: either rack (default) or scalar (angle brackets) *)
+and param =
+  | PRack of ident * typ option        (** x or (x : float rack) *)
+  | PScalar of ident * typ option      (** <x> or (<x> : float) *)
+
+(** Binding in let expressions *)
+and binding = {
+  bind_name: ident;
+  bind_type: typ option;
+  bind_expr: expr;
 }
 
-and param = PVar of ident * typ option | PScalar of scalar_ident * typ option
+(** Field initialization in records *)
+and field_init = {
+  init_field: ident;
+  init_value: expr;
+}
 
-(* Rails - the core parallel branching construct *)
-and rail = rail_kind node
-and rail_kind = { rail_cond : rail_cond; rail_body : expr }
+(** Tine: a named mask declaration
+    | tine name := predicate
+*)
+and tine = {
+  tine_name: ident;
+  tine_pred: predicate;
+}
 
-and rail_cond =
-  | RCNamed of ident * predicate (* name := predicate *)
-  | RCAnon of predicate (* just predicate *)
-  | RCOtherwise (* otherwise *)
-  | RCRef of ident (* reference to named rail *)
+(** Predicate for tine conditions *)
+and predicate = predicate_kind node
+and predicate_kind =
+  | PExpr of expr                      (** arbitrary boolean expr *)
+  | PCmp of expr * cmp_op * expr       (** x > y *)
+  | PIs of expr * expr                 (** x is <val> *)
+  | PIsNot of expr * expr              (** x is not <val> *)
+  | PAnd of predicate * predicate      (** p && q *)
+  | POr of predicate * predicate       (** p || q *)
+  | PNot of predicate                  (** !p *)
+  | PTineRef of ident                  (** reference another tine *)
 
-and predicate = pred_kind node
+and cmp_op = CLt | CLe | CGt | CGe | CEq | CNe
 
-and pred_kind =
-  | PExpr of expr
-  | PIs of expr * expr
-  | PIsNot of expr * expr
-  | PCmp of expr * cmp_op * expr
-  | PAnd of predicate * predicate
-  | POr of predicate * predicate
-  | PNot of predicate
+(** Through block: execute under a mask
+    through tine [else passthru]:
+      body
+    -> result_binding
+*)
+and through = {
+  through_tine: tine_ref;              (** which tine(s) to use *)
+  through_passthru: expr option;       (** else value for inactive lanes *)
+  through_body: stmt list;             (** statements in the block *)
+  through_result: expr;                (** final expression *)
+  through_binding: ident;              (** -> binding_name *)
+}
 
-and cmp_op = CLt | CLe | CGt | CGe [@@deriving show, eq]
+and tine_ref =
+  | TRSingle of ident                  (** through tine_name *)
+  | TRComposed of predicate            (** through (a && b) *)
 
-(* Statements for imperative sections *)
-type stmt = stmt_kind node
+(** Sweep block: collect results from tines
+    sweep:
+      | tine -> value
+      ...
+    -> result
+*)
+and sweep = {
+  sweep_arms: sweep_arm list;
+  sweep_binding: ident;
+}
 
+and sweep_arm = {
+  arm_tine: ident option;              (** None = catch-all _ *)
+  arm_value: expr;
+}
+
+(** Statements (in through/run blocks) *)
+and stmt = stmt_kind node
 and stmt_kind =
-  | SLet of binding
-  | SLetScalar of scalar_binding
-  | SAssign of expr * expr (* lhs <- rhs *)
-  | SExpr of expr
-  | SSweep of ident * ident * stmt list (* sweep source -> target: body *)
-  | SCompact of ident (* compact pack - remove retired lanes *)
-  | SSpread of
-      ident * ident * stmt list (* spread source across cores -> chunk: body *)
-  | SRepeat of expr * scalar_ident option * stmt list
-  | SRepeatUntil of scalar_ident * stmt list
-  | SSync (* sync - synchronization barrier *)
-  | SHalt (* halt - stop all execution *)
-[@@deriving show, eq]
+  | SLet of binding                    (** let x = e *)
+  | SAssign of ident * expr            (** x <- e *)
+  | SExpr of expr                      (** expression statement *)
 
-(* Top-level definitions *)
-type field = { field_name : ident; field_type : typ } [@@deriving show, eq]
+[@@deriving show]
 
+(** Field in stack/single definitions *)
+type field = {
+  field_name: ident;
+  field_type: typ;
+}
+[@@deriving show]
+
+(** Top-level definitions *)
 type def = def_kind node
-
 and def_kind =
-  (* Stack: Structure-of-Arrays, the default parallel data type *)
-  | DStack of ident * field list
-  (* AoS: Array-of-Structures for interop *)
-  | DAos of ident * field list
-  (* Single: all-scalar config struct *)
-  | DSingle of ident * field list
-  (* Type alias *)
-  | DType of ident * typ
-  (* Crunch: single-rail pure function, ML-style params *)
-  | DCrunch of ident * param list * expr
-  (* Rake: multi-rail parallel function with optional result clause *)
-  | DRake of ident * param list * expr * expr option
-  (* Run: sequential composition with temporal iteration, requires result clause *)
-  | DRun of ident * param list * stmt list * expr
-[@@deriving show, eq]
+  (* Type definitions *)
+  | DStack of ident * field list       (** stack Particle { ... } *)
+  | DSingle of ident * field list      (** single Config { ... } *)
+  | DType of ident * typ               (** type alias *)
 
-(* Module *)
-type modul = { mod_name : ident; mod_imports : ident list; mod_defs : def list }
-[@@deriving show, eq]
+  (* Function definitions *)
+  | DCrunch of ident * param list * result_spec * stmt list
+      (** crunch name params -> result: body *)
+  | DRake of ident * param list * result_spec * stmt list * tine list * through list * sweep
+      (** rake name params -> result: setup tines through* sweep *)
+  | DRun of ident * param list * result_spec * stmt list
+      (** run name params -> result: body *)
 
-(* Program *)
-type program = modul list [@@deriving show, eq]
+and result_spec = {
+  result_name: ident;
+  result_type: typ option;
+}
+[@@deriving show]
+
+(** Module *)
+type module_ = {
+  mod_name: ident;
+  mod_defs: def list;
+}
+[@@deriving show]
+
+(** Program: list of modules *)
+type program = module_ list
+[@@deriving show]
