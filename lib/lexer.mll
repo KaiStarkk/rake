@@ -209,3 +209,59 @@ and string_lit buf = parse
   | newline { raise (LexError ("Newline in string literal", get_pos lexbuf)) }
   | eof { raise (LexError ("Unterminated string", get_pos lexbuf)) }
   | _ as c { Buffer.add_char buf c; string_lit buf lexbuf }
+
+{
+let show_token = function
+  | FLOAT -> "FLOAT" | DOUBLE -> "DOUBLE" | INT -> "INT" | INT8 -> "INT8"
+  | INT16 -> "INT16" | INT64 -> "INT64" | UINT -> "UINT" | UINT8 -> "UINT8"
+  | UINT16 -> "UINT16" | UINT64 -> "UINT64" | BOOL -> "BOOL"
+  | VEC2 -> "VEC2" | VEC3 -> "VEC3" | VEC4 -> "VEC4"
+  | MAT3 -> "MAT3" | MAT4 -> "MAT4"
+  | RACK -> "RACK" | MASK -> "MASK" | STACK -> "STACK" | SINGLE -> "SINGLE"
+  | PACK -> "PACK" | TYPE -> "TYPE"
+  | CRUNCH -> "CRUNCH" | RAKE -> "RAKE" | RUN -> "RUN"
+  | TINE_REF s -> Printf.sprintf "TINE_REF(%s)" s
+  | THROUGH -> "THROUGH" | SWEEP -> "SWEEP" | ELSE -> "ELSE"
+  | RESULTS -> "RESULTS" | IN -> "IN"
+  | OVER -> "OVER" | REPEAT -> "REPEAT" | TIMES -> "TIMES" | UNTIL -> "UNTIL"
+  | LET -> "LET" | FUN -> "FUN" | WITH -> "WITH"
+  | LANES -> "LANES" | FMA -> "FMA" | OUTER -> "OUTER"
+  | COMPRESS -> "COMPRESS" | EXPAND -> "EXPAND" | BROADCAST -> "BROADCAST"
+  | TRUE -> "TRUE" | FALSE -> "FALSE"
+  | IS -> "IS" | NOT -> "NOT" | AND -> "AND" | OR -> "OR"
+  | PLUS -> "PLUS" | MINUS -> "MINUS" | STAR -> "STAR" | SLASH -> "SLASH"
+  | PERCENT -> "PERCENT" | LT -> "LT" | LE -> "LE" | GT -> "GT" | GE -> "GE"
+  | EQ -> "EQ" | NE -> "NE" | AMPAMP -> "AMPAMP" | PIPEPIPE -> "PIPEPIPE"
+  | BANG -> "BANG" | PIPE -> "PIPE" | ARROW -> "ARROW" | ASSIGN -> "ASSIGN"
+  | COLONEQ -> "COLONEQ" | SHUFFLE -> "SHUFFLE" | INTERLEAVE -> "INTERLEAVE"
+  | SHL -> "SHL" | SHR -> "SHR" | ROL -> "ROL" | ROR -> "ROR"
+  | COMPRESS_STORE -> "COMPRESS_STORE" | EXPAND_LOAD -> "EXPAND_LOAD"
+  | REDUCE_ADD -> "REDUCE_ADD" | REDUCE_MUL -> "REDUCE_MUL"
+  | REDUCE_MIN -> "REDUCE_MIN" | REDUCE_MAX -> "REDUCE_MAX"
+  | REDUCE_OR -> "REDUCE_OR" | REDUCE_AND -> "REDUCE_AND"
+  | SCAN_ADD -> "SCAN_ADD" | SCAN_MUL -> "SCAN_MUL"
+  | SCAN_MIN -> "SCAN_MIN" | SCAN_MAX -> "SCAN_MAX"
+  | LPAREN -> "LPAREN" | RPAREN -> "RPAREN" | LBRACE -> "LBRACE"
+  | RBRACE -> "RBRACE" | LBRACKET -> "LBRACKET" | RBRACKET -> "RBRACKET"
+  | COMMA -> "COMMA" | COLON -> "COLON" | SEMICOLON -> "SEMICOLON"
+  | PIPE_CHAR -> "PIPE_CHAR" | AT -> "AT" | DOT -> "DOT"
+  | UNDERSCORE -> "UNDERSCORE"
+  | INT_LIT n -> Printf.sprintf "INT_LIT(%Ld)" n
+  | FLOAT_LIT f -> Printf.sprintf "FLOAT_LIT(%g)" f
+  | STRING_LIT s -> Printf.sprintf "STRING_LIT(%S)" s
+  | IDENT s -> Printf.sprintf "IDENT(%s)" s
+  | SCALAR_IDENT s -> Printf.sprintf "SCALAR_IDENT(%s)" s
+  | EOF -> "EOF"
+
+let emit lexbuf =
+  let buf = Buffer.create 256 in
+  let rec loop () =
+    let tok = token lexbuf in
+    let pos = lexbuf.Lexing.lex_curr_p in
+    Buffer.add_string buf (Printf.sprintf "%d:%d %s\n"
+      pos.Lexing.pos_lnum (pos.Lexing.pos_cnum - pos.Lexing.pos_bol) (show_token tok));
+    if tok <> EOF then loop ()
+  in
+  loop ();
+  Buffer.contents buf
+}
