@@ -1,23 +1,57 @@
 (** Rake 0.2.0 MLIR Emitter
 
-    Generates MLIR for both CPU SIMD and GPU targets.
+    Generates MLIR for both CPU SIMD and GPU targets with width-parameterized
+    vector emission for runtime SIMD multi-versioning.
 
-    CPU mode (width 8):
+    ==========================================================================
+    ARCHITECTURE: Width-Parameterized Emission for Multi-Versioning
+    ==========================================================================
+
+    This emitter is designed to support runtime SIMD dispatch via function
+    multi-versioning. The upper layer (MLIR/LLVM) will call this emitter
+    multiple times with different widths to generate specialized versions:
+
+      Width  | ISA Target       | Register Type  | Use Case
+      -------|------------------|----------------|---------------------------
+        1    | Scalar / GPU     | xmm (scalar)   | GPU backends, fallback
+        4    | SSE / NEON       | xmm (128-bit)  | Baseline x86/ARM SIMD
+        8    | AVX / AVX2       | ymm (256-bit)  | Modern x86 (default CPU)
+       16    | AVX-512          | zmm (512-bit)  | High-end x86, datacenter
+       16+   | AVX10 / SVE      | scalable       | Future: SVE, AVX10.2, etc.
+
+    The emitter is structured so that:
+    - All type helpers are parameterized by ctx.width
+    - Loop constructs adapt: scf.for (vector) vs scf.parallel (scalar)
+    - Memory ops adapt: vector.load/maskedstore vs memref.load/store
+    - The same Rake source produces correct code for any width
+
+    FUTURE: The compiler driver will:
+    1. Query target CPU features (cpuid / /proc/cpuinfo)
+    2. Emit multiple width variants into the same module
+    3. Generate runtime dispatch based on feature detection
+    4. Link with ifunc or similar mechanism for transparent dispatch
+
+    ==========================================================================
+    Current Implementation
+    ==========================================================================
+
+    CPU mode (width 8, AVX2):
     - scf.for loops with explicit vectorization
-    - vector.load/store for memory
+    - vector.load/store for memory operations
     - vector<8xT> types throughout
+    - Tail masking via vector.create_mask + vector.maskedstore
 
-    GPU mode (width 1):
+    GPU mode (width 1, scalar):
     - scf.parallel loops declaring independent iterations
-    - memref.load/store for memory
+    - memref.load/store for memory (scalar)
     - Scalar types (f32, i32, etc.)
-    - Let MLIR passes handle parallelization
+    - MLIR/SPIR-V passes handle GPU parallelization
 
-    Key mappings (both modes):
-    - Tine predicates → arith.cmpf/cmpi → mask type
-    - Through blocks → arith.select with passthru
-    - Sweep → nested arith.select
-    - Reductions → vector.reduction (CPU) / direct ops (GPU)
+    Key mappings (all widths):
+    - Tine predicates → arith.cmpf/cmpi → vector<WxI1> or i1
+    - Through blocks → arith.select (CPU) / scf.if (GPU)
+    - Sweep → nested arith.select chain
+    - Reductions → vector.reduction (vector) / identity (scalar)
 
     Target dialects: func, arith, vector, math, scf, memref
 *)
@@ -25,10 +59,25 @@
 open Ast
 open Types
 
-(** Target mode *)
+(** Target mode for emission.
+    FUTURE: This will expand to include specific ISA targets:
+    - SSE4 (width=4), AVX2 (width=8), AVX512 (width=16)
+    - ARM NEON (width=4), SVE (scalable)
+    - GPU variants (CUDA, Vulkan/SPIR-V, Metal)
+
+    For now, CPU means "explicit vectorization" and GPU means "parallel scalar". *)
 type target = CPU | GPU
 
-(** Emission context *)
+(** Emission context.
+
+    The key field for multi-versioning is [width]:
+    - width=1: Scalar mode (GPU, or fallback)
+    - width=4: SSE/NEON (128-bit vectors)
+    - width=8: AVX/AVX2 (256-bit vectors) - current default
+    - width=16: AVX-512 (512-bit vectors)
+
+    All emission helpers read ctx.width to determine vector types,
+    enabling the same code path to emit for any SIMD width. *)
 type ctx = {
   mutable buf: Buffer.t;
   mutable indent: int;
@@ -43,11 +92,25 @@ type ctx = {
   mutable current_over_iter: string option;   (* Current iteration index (GPU mode) *)
   mutable output_memref: string option;       (* Output memref for run function results *)
   target: target;                             (* CPU or GPU emission mode *)
-  width: int;                                 (* Vector width: 8 for CPU, 1 for GPU *)
+  width: int;                                 (* Vector width: 1, 4, 8, 16, etc. *)
 }
 
-let create_ctx ?(target=CPU) env =
-  let width = match target with CPU -> 8 | GPU -> 1 in
+(** Create emission context with specified target and width.
+
+    Width controls SIMD vector size:
+      ~width:1  - Scalar (GPU, or fallback)
+      ~width:4  - SSE/NEON (128-bit)
+      ~width:8  - AVX/AVX2 (256-bit) - default for CPU
+      ~width:16 - AVX-512 (512-bit)
+
+    For multi-versioning, call this multiple times with different widths
+    to generate ISA-specific function variants. *)
+let create_ctx ?(target=CPU) ?width env =
+  (* Use explicit width if provided, otherwise infer from target *)
+  let width = match width with
+    | Some w -> w
+    | None -> match target with CPU -> 8 | GPU -> 1
+  in
   {
     buf = Buffer.create 4096;
     indent = 0;
@@ -85,9 +148,16 @@ let emit_inline ctx fmt =
   done;
   Printf.kbprintf (fun _ -> ()) ctx.buf fmt
 
-(** Width-aware MLIR type for Rake type.
-    In GPU mode (width=1), Rack types become scalars.
-    In CPU mode (width=8), Rack types become vectors. *)
+(** Width-parameterized MLIR type for Rake type.
+
+    This is the core function enabling multi-versioning:
+    - width=1:  Rack Float → "f32"           (scalar)
+    - width=4:  Rack Float → "vector<4xf32>" (SSE/NEON)
+    - width=8:  Rack Float → "vector<8xf32>" (AVX/AVX2)
+    - width=16: Rack Float → "vector<16xf32>" (AVX-512)
+
+    Scalar types remain unchanged regardless of width.
+    Mask types follow the same width (i1 vs vector<Wxi1>). *)
 let rec mlir_type_w width = function
   | Rack SFloat -> if width = 1 then "f32" else Printf.sprintf "vector<%dxf32>" width
   | Rack SDouble -> if width = 1 then "f64" else Printf.sprintf "vector<%dxf64>" width
@@ -111,13 +181,21 @@ let rec mlir_type_w width = function
   | Unit -> "()"
   | _ -> "!rake.unknown"
 
-(** Context-aware type helpers *)
+(** Context-aware type helpers.
+
+    These read ctx.width to emit the correct type for the current target:
+    - data_type: The primary data vector type (f32 or vector<Wxf32>)
+    - mask_type: Comparison result type (i1 or vector<Wxi1>)
+    - int_type:  Integer lane type (i32 or vector<Wxi32>)
+
+    Using these consistently ensures width-agnostic code generation. *)
 let mlir_type ctx t = mlir_type_w ctx.width t
 let data_type ctx = if ctx.width = 1 then "f32" else Printf.sprintf "vector<%dxf32>" ctx.width
 let mask_type ctx = if ctx.width = 1 then "i1" else Printf.sprintf "vector<%dxi1>" ctx.width
 let int_type ctx = if ctx.width = 1 then "i32" else Printf.sprintf "vector<%dxi32>" ctx.width
 
-(** Check if we're in scalar (GPU) mode *)
+(** Check if we're in scalar mode (width=1).
+    Scalar mode uses different loop constructs and memory operations. *)
 let is_scalar_mode ctx = ctx.width = 1
 
 (** Emit a binary operation *)
@@ -321,7 +399,13 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
            (* Try chunk.field format first (for over loop bindings) *)
            let chunk_field_key = var_name ^ "." ^ field in
            (match Hashtbl.find_opt ctx.vars chunk_field_key with
-            | Some ssa -> (ssa, Rack SFloat)  (* TODO: proper field type *)
+            | Some ssa ->
+                (* Look up base type to get proper field type *)
+                let base_t = match Hashtbl.find_opt ctx.type_env.vars var_name with
+                  | Some t -> t
+                  | None -> Rack SFloat  (* fallback for untyped vars *)
+                in
+                (ssa, get_field_type base_t field)
             | None ->
                 (* Fall back to base_field format *)
                 let (base, t) = emit_expr ctx e in
@@ -329,18 +413,14 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
                 (match Hashtbl.find_opt ctx.vars field_var with
                  | Some ssa -> (ssa, get_field_type t field)
                  | None ->
-                     let result = fresh ctx field in
-                     emit ctx "// Field access: %s.%s" base field;
-                     (result, get_field_type t field)))
+                     failwith (Printf.sprintf "Field %s.%s not bound in context" var_name field)))
        | _ ->
            let (base, t) = emit_expr ctx e in
            let field_var = base ^ "_" ^ field in
            (match Hashtbl.find_opt ctx.vars field_var with
             | Some ssa -> (ssa, get_field_type t field)
             | None ->
-                let result = fresh ctx field in
-                emit ctx "// Field access: %s.%s" base field;
-                (result, get_field_type t field)))
+                failwith (Printf.sprintf "Field access %s.%s not bound in context" base field)))
 
   | EBroadcast e ->
       let (val_, t) = emit_expr ctx e in
@@ -419,15 +499,39 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
       Hashtbl.add ctx.type_env.vars binding.bind_name t;
       emit_expr ctx body
 
-  | _ ->
-      (* Fallback for unhandled expressions *)
-      let result = fresh ctx "todo" in
-      let dt = data_type ctx in
-      if is_scalar_mode ctx then
-        emit ctx "%s = arith.constant 0.0 : %s" result dt
-      else
-        emit ctx "%s = arith.constant dense<0.0> : %s" result dt;
-      (result, Rack SFloat)
+  (* Explicitly fail on unhandled expressions - no silent fallback *)
+  | ELambda _ ->
+      failwith "Unhandled expression: ELambda (closures not yet implemented)"
+  | EPipe _ ->
+      failwith "Unhandled expression: EPipe (should be desugared before emission)"
+  | EWith _ ->
+      failwith "Unhandled expression: EWith (record update not yet implemented)"
+  | EExtract _ ->
+      failwith "Unhandled expression: EExtract (lane extraction not yet implemented)"
+  | EInsert _ ->
+      failwith "Unhandled expression: EInsert (lane insertion not yet implemented)"
+  | EScan _ ->
+      failwith "Unhandled expression: EScan (prefix scan not yet implemented)"
+  | EShuffle _ ->
+      failwith "Unhandled expression: EShuffle (shuffle not yet implemented)"
+  | EShift _ ->
+      failwith "Unhandled expression: EShift (vector shift not yet implemented)"
+  | ERotate _ ->
+      failwith "Unhandled expression: ERotate (vector rotate not yet implemented)"
+  | EGather _ ->
+      failwith "Unhandled expression: EGather (gather not yet implemented)"
+  | EScatter _ ->
+      failwith "Unhandled expression: EScatter (scatter not yet implemented)"
+  | ECompress _ ->
+      failwith "Unhandled expression: ECompress (compress not yet implemented)"
+  | EExpand _ ->
+      failwith "Unhandled expression: EExpand (expand not yet implemented)"
+  | ETines _ ->
+      failwith "Unhandled expression: ETines (should be handled via emit_sweep)"
+  | EFma _ ->
+      failwith "Unhandled expression: EFma (fused multiply-add not yet implemented)"
+  | EOuter _ ->
+      failwith "Unhandled expression: EOuter (outer product not yet implemented)"
 
 and get_field_type t field =
   match t with
@@ -456,7 +560,15 @@ let rec emit_stmt ctx (stmt: Ast.stmt) =
       (* Emit scf.for loop over pack in stack-sized chunks *)
       emit_over_loop ctx over
 
-(** Emit over loop: CPU uses scf.for with vectors, GPU uses scf.parallel with scalars *)
+(** Emit over loop with width-appropriate constructs.
+
+    This is where multi-versioning manifests in loop structure:
+    - width=1 (scalar/GPU): scf.parallel with memref.load/store
+    - width>1 (vector/CPU): scf.for with vector.load/maskedstore
+
+    For CPU multi-versioning (SSE/AVX/AVX-512), only the width changes;
+    the loop structure remains scf.for with vector operations.
+    The vector width (4, 8, 16) determines register utilization. *)
 and emit_over_loop ctx (over: Ast.over_loop) =
   (* Get count expression and its type - handle scalar variable specially *)
   let (count_val, count_type) = match over.over_count.v with
@@ -992,8 +1104,8 @@ let emit_module ctx (m: Ast.module_) =
   List.iter (emit_def ctx) m.mod_defs
 
 (** Emit a program with specified target *)
-let emit_program ?(target=CPU) env (prog: Ast.program) =
-  let ctx = create_ctx ~target env in
+let emit_program ?(target=CPU) ?width env (prog: Ast.program) =
+  let ctx = create_ctx ~target ?width env in
   let target_comment = match target with
     | CPU -> Printf.sprintf "CPU SIMD (width %d)" ctx.width
     | GPU -> "GPU scalar (scf.parallel)"
@@ -1006,10 +1118,15 @@ let emit_program ?(target=CPU) env (prog: Ast.program) =
   emit ctx "}";
   Buffer.contents ctx.buf
 
-(** Main entry point - CPU mode (default) *)
-let emit env prog =
-  emit_program ~target:CPU env prog
+(** Main entry point - CPU mode with configurable width
+    ~width: Vector width (default 8 for AVX2)
+      1  = scalar fallback
+      4  = SSE (128-bit)
+      8  = AVX/AVX2 (256-bit) - default
+      16 = AVX-512 (512-bit) *)
+let emit ?(width=8) env prog =
+  emit_program ~target:CPU ~width env prog
 
-(** GPU mode entry point *)
+(** GPU mode entry point (always width=1, scalar parallel) *)
 let emit_gpu env prog =
-  emit_program ~target:GPU env prog
+  emit_program ~target:GPU ~width:1 env prog

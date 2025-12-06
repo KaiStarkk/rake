@@ -210,9 +210,19 @@ let rec infer_expr env (expr: Ast.expr) : t =
       let t = infer_expr env e in
       infer_unop t op expr.loc
 
-  | ECall (name, _args) -> (
+  | ECall (name, args) -> (
       match Hashtbl.find_opt env.funcs name with
-      | Some (_, ret) -> ret
+      | Some (param_types, ret) ->
+          let arg_types = List.map (infer_expr env) args in
+          if List.length arg_types <> List.length param_types then
+            type_errorf expr.loc "Function %s expects %d args, got %d"
+              name (List.length param_types) (List.length arg_types);
+          List.iter2 (fun expected actual ->
+            if not (compatible expected actual) then
+              type_errorf expr.loc "Argument type mismatch: expected %s, got %s"
+                (show_concise expected) (show_concise actual)
+          ) param_types arg_types;
+          ret
       | None -> type_errorf expr.loc "Unknown function: %s" name)
 
   | ELet (binding, body) ->
