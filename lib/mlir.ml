@@ -1,22 +1,32 @@
 (** Rake 0.2.0 MLIR Emitter
 
-    Generates MLIR using the vector dialect for SIMD operations.
+    Generates MLIR for both CPU SIMD and GPU targets.
 
-    Key mappings:
-    - Tine predicates → arith.cmpf/cmpi → vector<8xi1>
-    - Through blocks → vector.mask with passthru
+    CPU mode (width 8):
+    - scf.for loops with explicit vectorization
+    - vector.load/store for memory
+    - vector<8xT> types throughout
+
+    GPU mode (width 1):
+    - scf.parallel loops declaring independent iterations
+    - memref.load/store for memory
+    - Scalar types (f32, i32, etc.)
+    - Let MLIR passes handle parallelization
+
+    Key mappings (both modes):
+    - Tine predicates → arith.cmpf/cmpi → mask type
+    - Through blocks → arith.select with passthru
     - Sweep → nested arith.select
-    - Scalars → vector.broadcast
-    - Reductions → vector.reduction
+    - Reductions → vector.reduction (CPU) / direct ops (GPU)
 
-    Target dialects: func, arith, vector, math
+    Target dialects: func, arith, vector, math, scf, memref
 *)
 
 open Ast
 open Types
 
-(** Vector width (default AVX2) *)
-let vector_width = 8
+(** Target mode *)
+type target = CPU | GPU
 
 (** Emission context *)
 type ctx = {
@@ -30,22 +40,30 @@ type ctx = {
   pack_memrefs: (string, string) Hashtbl.t;  (* "pack.field" -> memref SSA name *)
   mutable current_over_offset: string option; (* Current over loop offset for loads *)
   mutable current_over_mask: string option;   (* Current tail mask for masked stores *)
-  mutable output_memref: string option;        (* Output memref for run function results *)
+  mutable current_over_iter: string option;   (* Current iteration index (GPU mode) *)
+  mutable output_memref: string option;       (* Output memref for run function results *)
+  target: target;                             (* CPU or GPU emission mode *)
+  width: int;                                 (* Vector width: 8 for CPU, 1 for GPU *)
 }
 
-let create_ctx env = {
-  buf = Buffer.create 4096;
-  indent = 0;
-  ssa_counter = 0;
-  vars = Hashtbl.create 64;
-  tines = Hashtbl.create 16;
-  types = env.Typecheck.types;
-  type_env = env;
-  pack_memrefs = Hashtbl.create 32;
-  current_over_offset = None;
-  current_over_mask = None;
-  output_memref = None;
-}
+let create_ctx ?(target=CPU) env =
+  let width = match target with CPU -> 8 | GPU -> 1 in
+  {
+    buf = Buffer.create 4096;
+    indent = 0;
+    ssa_counter = 0;
+    vars = Hashtbl.create 64;
+    tines = Hashtbl.create 16;
+    types = env.Typecheck.types;
+    type_env = env;
+    pack_memrefs = Hashtbl.create 32;
+    current_over_offset = None;
+    current_over_mask = None;
+    current_over_iter = None;
+    output_memref = None;
+    target;
+    width;
+  }
 
 (** Generate fresh SSA name *)
 let fresh ctx prefix =
@@ -67,35 +85,40 @@ let emit_inline ctx fmt =
   done;
   Printf.kbprintf (fun _ -> ()) ctx.buf fmt
 
-(** MLIR type for Rake type *)
-let rec mlir_type = function
-  | Rack SFloat -> Printf.sprintf "vector<%dxf32>" vector_width
-  | Rack SDouble -> Printf.sprintf "vector<%dxf64>" vector_width
-  | Rack SInt -> Printf.sprintf "vector<%dxi32>" vector_width
-  | Rack SInt64 -> Printf.sprintf "vector<%dxi64>" vector_width
-  | Rack SBool -> Printf.sprintf "vector<%dxi1>" vector_width
+(** Width-aware MLIR type for Rake type.
+    In GPU mode (width=1), Rack types become scalars.
+    In CPU mode (width=8), Rack types become vectors. *)
+let rec mlir_type_w width = function
+  | Rack SFloat -> if width = 1 then "f32" else Printf.sprintf "vector<%dxf32>" width
+  | Rack SDouble -> if width = 1 then "f64" else Printf.sprintf "vector<%dxf64>" width
+  | Rack SInt -> if width = 1 then "i32" else Printf.sprintf "vector<%dxi32>" width
+  | Rack SInt64 -> if width = 1 then "i64" else Printf.sprintf "vector<%dxi64>" width
+  | Rack SBool -> if width = 1 then "i1" else Printf.sprintf "vector<%dxi1>" width
   | Scalar SFloat -> "f32"
   | Scalar SDouble -> "f64"
   | Scalar SInt -> "i32"
   | Scalar SInt64 -> "i64"
   | Scalar SBool -> "i1"
-  | Mask -> Printf.sprintf "vector<%dxi1>" vector_width
+  | Mask -> if width = 1 then "i1" else Printf.sprintf "vector<%dxi1>" width
   | Stack (_name, fields) ->
-      (* For now, emit as tuple of vectors *)
-      let field_types = List.map (fun (_, t) -> mlir_type t) fields in
+      let field_types = List.map (fun (_, t) -> mlir_type_w width t) fields in
       "tuple<" ^ String.concat ", " field_types ^ ">"
   | Single (_name, fields) ->
-      (* Single types are tuples of scalars *)
-      let field_types = List.map (fun (_, t) -> mlir_type t) fields in
+      let field_types = List.map (fun (_, t) -> mlir_type_w width t) fields in
       "tuple<" ^ String.concat ", " field_types ^ ">"
   | Tuple ts ->
-      "tuple<" ^ String.concat ", " (List.map mlir_type ts) ^ ">"
+      "tuple<" ^ String.concat ", " (List.map (mlir_type_w width) ts) ^ ">"
   | Unit -> "()"
   | _ -> "!rake.unknown"
 
-(** MLIR type for vector of floats *)
-let vec_f32 = Printf.sprintf "vector<%dxf32>" vector_width
-let vec_i1 = Printf.sprintf "vector<%dxi1>" vector_width
+(** Context-aware type helpers *)
+let mlir_type ctx t = mlir_type_w ctx.width t
+let data_type ctx = if ctx.width = 1 then "f32" else Printf.sprintf "vector<%dxf32>" ctx.width
+let mask_type ctx = if ctx.width = 1 then "i1" else Printf.sprintf "vector<%dxi1>" ctx.width
+let int_type ctx = if ctx.width = 1 then "i32" else Printf.sprintf "vector<%dxi32>" ctx.width
+
+(** Check if we're in scalar (GPU) mode *)
+let is_scalar_mode ctx = ctx.width = 1
 
 (** Emit a binary operation *)
 let emit_binop ctx op t1 t2 lhs rhs =
@@ -121,8 +144,8 @@ let emit_binop ctx op t1 t2 lhs rhs =
     | _ -> "arith.addf"  (* TODO: handle other ops *)
   in
   let result_type = match op with
-    | Lt | Le | Gt | Ge | Eq | Ne -> vec_i1
-    | _ -> mlir_type (binop_result t1 t2)
+    | Lt | Le | Gt | Ge | Eq | Ne -> mask_type ctx
+    | _ -> mlir_type ctx (binop_result t1 t2)
   in
   emit ctx "%s = %s %s, %s : %s" result op_name lhs rhs result_type;
   result
@@ -130,33 +153,43 @@ let emit_binop ctx op t1 t2 lhs rhs =
 (** Emit a unary operation *)
 let emit_unop ctx op t arg =
   let result = fresh ctx "v" in
-  let ty = mlir_type t in
+  let ty = mlir_type ctx t in
   (match op with
    | Neg | FNeg ->
        emit ctx "%s = arith.negf %s : %s" result arg ty
    | Not ->
        (* For masks, use xor with all-ones *)
        let ones = fresh ctx "ones" in
-       emit ctx "%s = arith.constant dense<true> : %s" ones vec_i1;
-       emit ctx "%s = arith.xori %s, %s : %s" result arg ones vec_i1);
+       let mask_t = mask_type ctx in
+       if is_scalar_mode ctx then
+         emit ctx "%s = arith.constant 1 : %s" ones mask_t
+       else
+         emit ctx "%s = arith.constant dense<true> : %s" ones mask_t;
+       emit ctx "%s = arith.xori %s, %s : %s" result arg ones mask_t);
   result
 
-(** Emit broadcast of scalar to vector (only if needed) *)
+(** Emit broadcast of scalar to vector (only if needed).
+    In GPU mode (width=1), broadcast is a no-op. *)
 let emit_broadcast ctx scalar_val scalar_type =
   match scalar_type with
   | Rack _ | Mask ->
-      (* Already a vector, no broadcast needed *)
+      (* Already a vector/rack, no broadcast needed *)
       scalar_val
   | _ ->
-      let result = fresh ctx "bcast" in
-      let vec_type = match scalar_type with
-        | Scalar SFloat -> vec_f32
-        | Scalar SInt -> Printf.sprintf "vector<%dxi32>" vector_width
-        | _ -> vec_f32
-      in
-      emit ctx "%s = vector.broadcast %s : %s to %s" result scalar_val
-        (mlir_type scalar_type) vec_type;
-      result
+      if is_scalar_mode ctx then
+        (* GPU mode: no broadcast needed, everything is scalar *)
+        scalar_val
+      else begin
+        let result = fresh ctx "bcast" in
+        let vec_type = match scalar_type with
+          | Scalar SFloat -> data_type ctx
+          | Scalar SInt -> int_type ctx
+          | _ -> data_type ctx
+        in
+        emit ctx "%s = vector.broadcast %s : %s to %s" result scalar_val
+          (mlir_type_w 1 scalar_type) vec_type;
+        result
+      end
 
 (** Emit expression, return SSA name and type *)
 let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
@@ -164,19 +197,31 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
   | EInt n ->
       let result = fresh ctx "c" in
       (* In vector context, treat integers as floats for arithmetic *)
-      emit ctx "%s = arith.constant dense<%Ld.0> : %s" result n vec_f32;
+      let dt = data_type ctx in
+      if is_scalar_mode ctx then
+        emit ctx "%s = arith.constant %Ld.0 : %s" result n dt
+      else
+        emit ctx "%s = arith.constant dense<%Ld.0> : %s" result n dt;
       (result, Rack SFloat)
 
   | EFloat f ->
       let result = fresh ctx "c" in
       (* Use proper float formatting to ensure decimal point *)
       let f_str = if Float.is_integer f then Printf.sprintf "%.1f" f else Printf.sprintf "%g" f in
-      emit ctx "%s = arith.constant dense<%s> : %s" result f_str vec_f32;
+      let dt = data_type ctx in
+      if is_scalar_mode ctx then
+        emit ctx "%s = arith.constant %s : %s" result f_str dt
+      else
+        emit ctx "%s = arith.constant dense<%s> : %s" result f_str dt;
       (result, Rack SFloat)
 
   | EBool b ->
       let result = fresh ctx "c" in
-      emit ctx "%s = arith.constant dense<%b> : %s" result b vec_i1;
+      let mt = mask_type ctx in
+      if is_scalar_mode ctx then
+        emit ctx "%s = arith.constant %b : %s" result b mt
+      else
+        emit ctx "%s = arith.constant dense<%b> : %s" result b mt;
       (result, Mask)
 
   | EVar name -> (
@@ -190,7 +235,11 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
       | None ->
           (* Undefined variable - shouldn't happen after type checking *)
           let result = fresh ctx "undef" in
-          emit ctx "%s = arith.constant dense<0.0> : %s" result vec_f32;
+          let dt = data_type ctx in
+          if is_scalar_mode ctx then
+            emit ctx "%s = arith.constant 0.0 : %s" result dt
+          else
+            emit ctx "%s = arith.constant dense<0.0> : %s" result dt;
           (result, Rack SFloat))
 
   | EScalarVar name -> (
@@ -234,7 +283,8 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
       (* Handle built-in math functions *)
       let emit_math_call fname arg =
         let result = fresh ctx "r" in
-        emit ctx "%s = math.%s %s : %s" result fname arg vec_f32;
+        let dt = data_type ctx in
+        emit ctx "%s = math.%s %s : %s" result fname arg dt;
         (result, Rack SFloat)
       in
       (match (name, args) with
@@ -254,13 +304,14 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
            (* User-defined function call *)
            let arg_results = List.map (emit_expr ctx) args in
            let arg_vals = List.map fst arg_results in
-           let arg_types = List.map (fun (_, t) -> mlir_type t) arg_results in
+           let arg_types = List.map (fun (_, t) -> mlir_type ctx t) arg_results in
            let result = fresh ctx "call" in
+           let dt = data_type ctx in
            emit ctx "%s = func.call @%s(%s) : (%s) -> %s"
              result name
              (String.concat ", " arg_vals)
              (String.concat ", " arg_types)
-             vec_f32;
+             dt;
            (result, Rack SFloat))
 
   | EField (e, field) ->
@@ -306,18 +357,36 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
         | RMax -> "maximumf"
         | _ -> "add"
       in
-      emit ctx "%s = vector.reduction <%s>, %s : %s into f32"
-        result op_name arg vec_f32;
-      (result, Scalar SFloat)
+      if is_scalar_mode ctx then
+        (* GPU mode: no reduction needed, value is already scalar *)
+        (arg, Scalar SFloat)
+      else begin
+        let dt = data_type ctx in
+        emit ctx "%s = vector.reduction <%s>, %s : %s into f32"
+          result op_name arg dt;
+        (result, Scalar SFloat)
+      end
 
   | ELaneIndex ->
       let result = fresh ctx "idx" in
-      emit ctx "%s = vector.step : vector<%dxi32>" result vector_width;
-      (result, Rack SInt)
+      if is_scalar_mode ctx then begin
+        (* GPU mode: lane index comes from current iteration *)
+        match ctx.current_over_iter with
+        | Some iter ->
+            (* Cast index to i32 *)
+            emit ctx "%s = arith.index_cast %s : index to i32" result iter;
+            (result, Scalar SInt)
+        | None ->
+            emit ctx "%s = arith.constant 0 : i32" result;
+            (result, Scalar SInt)
+      end else begin
+        emit ctx "%s = vector.step : vector<%dxi32>" result ctx.width;
+        (result, Rack SInt)
+      end
 
   | ELanes ->
       let result = fresh ctx "w" in
-      emit ctx "%s = arith.constant %d : i32" result vector_width;
+      emit ctx "%s = arith.constant %d : i32" result ctx.width;
       (result, Scalar SInt)
 
   | ERecord (name, inits) ->
@@ -353,7 +422,11 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
   | _ ->
       (* Fallback for unhandled expressions *)
       let result = fresh ctx "todo" in
-      emit ctx "%s = arith.constant dense<0.0> : %s" result vec_f32;
+      let dt = data_type ctx in
+      if is_scalar_mode ctx then
+        emit ctx "%s = arith.constant 0.0 : %s" result dt
+      else
+        emit ctx "%s = arith.constant dense<0.0> : %s" result dt;
       (result, Rack SFloat)
 
 and get_field_type t field =
@@ -383,7 +456,7 @@ let rec emit_stmt ctx (stmt: Ast.stmt) =
       (* Emit scf.for loop over pack in stack-sized chunks *)
       emit_over_loop ctx over
 
-(** Emit over loop: scf.for iterating over pack in chunks of lanes *)
+(** Emit over loop: CPU uses scf.for with vectors, GPU uses scf.parallel with scalars *)
 and emit_over_loop ctx (over: Ast.over_loop) =
   (* Get count expression and its type - handle scalar variable specially *)
   let (count_val, count_type) = match over.over_count.v with
@@ -400,16 +473,6 @@ and emit_over_loop ctx (over: Ast.over_loop) =
     | _ -> emit_expr ctx over.over_count
   in
 
-  (* Constants for loop bounds *)
-  let zero = fresh ctx "zero" in
-  let one = fresh ctx "one" in
-  let lanes_val = fresh ctx "lanes" in
-  let num_iters = fresh ctx "niters" in
-
-  emit ctx "%s = arith.constant 0 : index" zero;
-  emit ctx "%s = arith.constant 1 : index" one;
-  emit ctx "%s = arith.constant %d : index" lanes_val vector_width;
-
   (* Cast count to index - handle both integer and float types *)
   let count_idx = fresh ctx "count_idx" in
   (match count_type with
@@ -424,37 +487,29 @@ and emit_over_loop ctx (over: Ast.over_loop) =
    | _ ->
        emit ctx "%s = arith.index_cast %s : i64 to index" count_idx count_val);
 
-  (* Compute number of full iterations: ceil(count / lanes) *)
-  let count_plus = fresh ctx "count_plus" in
-  let lanes_minus_one = fresh ctx "lanes_m1" in
-  emit ctx "%s = arith.constant %d : index" lanes_minus_one (vector_width - 1);
-  emit ctx "%s = arith.addi %s, %s : index" count_plus count_idx lanes_minus_one;
-  emit ctx "%s = arith.divui %s, %s : index" num_iters count_plus lanes_val;
+  if is_scalar_mode ctx then
+    emit_over_loop_gpu ctx over count_idx
+  else
+    emit_over_loop_cpu ctx over count_idx
 
-  (* Emit scf.for loop *)
+(** GPU mode: scf.parallel with scalar operations, one element per iteration *)
+and emit_over_loop_gpu ctx (over: Ast.over_loop) count_idx =
+  let zero = fresh ctx "zero" in
+  let one = fresh ctx "one" in
+
+  emit ctx "%s = arith.constant 0 : index" zero;
+  emit ctx "%s = arith.constant 1 : index" one;
+
+  (* scf.parallel declares iterations are independent *)
   let iter_var = fresh ctx "i" in
-  emit ctx "scf.for %s = %s to %s step %s {" iter_var zero num_iters one;
+  emit ctx "scf.parallel (%s) = (%s) to (%s) step (%s) {" iter_var zero count_idx one;
   ctx.indent <- ctx.indent + 1;
 
-  (* Compute offset for this iteration *)
-  let offset = fresh ctx "offset" in
-  emit ctx "%s = arith.muli %s, %s : index" offset iter_var lanes_val;
+  (* Store iteration index for ELaneIndex *)
+  ctx.current_over_iter <- Some iter_var;
+  ctx.current_over_offset <- Some iter_var;  (* offset = iter in scalar mode *)
 
-  (* Store offset for field access *)
-  ctx.current_over_offset <- Some offset;
-
-  (* Compute tail mask for last iteration *)
-  let remaining = fresh ctx "remaining" in
-  let mask = fresh ctx "mask" in
-
-  emit ctx "%s = arith.subi %s, %s : index" remaining count_idx offset;
-  emit ctx "%s = vector.create_mask %s : %s" mask remaining vec_i1;
-
-  (* Store mask in context for masked operations *)
-  ctx.current_over_mask <- Some mask;
-
-  (* Load chunk fields from pack memrefs *)
-  (* Look up pack type to get field names *)
+  (* Load fields from pack memrefs using memref.load (scalar) *)
   (match Hashtbl.find_opt ctx.type_env.vars over.over_pack with
    | Some (Pack (_, fields)) ->
        List.iter (fun (field_name, _field_type) ->
@@ -462,8 +517,7 @@ and emit_over_loop ctx (over: Ast.over_loop) =
          match Hashtbl.find_opt ctx.pack_memrefs memref_key with
          | Some memref ->
              let loaded = fresh ctx field_name in
-             emit ctx "%s = vector.load %s[%s] : memref<?xf32>, %s" loaded memref offset vec_f32;
-             (* Bind chunk.field_name to loaded value *)
+             emit ctx "%s = memref.load %s[%s] : memref<?xf32>" loaded memref iter_var;
              Hashtbl.add ctx.vars (over.over_chunk ^ "." ^ field_name) loaded
          | None ->
              emit ctx "// Warning: no memref for %s" memref_key
@@ -485,8 +539,94 @@ and emit_over_loop ctx (over: Ast.over_loop) =
   (* Store result to output memref if available *)
   (match (!result_val, ctx.output_memref) with
    | (Some result, Some out_memref) ->
-       emit ctx "vector.maskedstore %s[%s], %s, %s : memref<?xf32>, vector<8xi1>, %s"
-         out_memref offset mask result vec_f32
+       emit ctx "memref.store %s, %s[%s] : memref<?xf32>" result out_memref iter_var
+   | (Some result, None) ->
+       emit ctx "// Result %s computed but no output memref" result
+   | _ ->
+       emit ctx "// No result expression in over loop body");
+
+  emit ctx "scf.reduce";
+  ctx.current_over_iter <- None;
+  ctx.current_over_offset <- None;
+  ctx.indent <- ctx.indent - 1;
+  emit ctx "}"
+
+(** CPU mode: scf.for with vector operations, lanes elements per iteration *)
+and emit_over_loop_cpu ctx (over: Ast.over_loop) count_idx =
+  let dt = data_type ctx in
+  let mt = mask_type ctx in
+  let width = ctx.width in
+
+  let zero = fresh ctx "zero" in
+  let one = fresh ctx "one" in
+  let lanes_val = fresh ctx "lanes" in
+  let num_iters = fresh ctx "niters" in
+
+  emit ctx "%s = arith.constant 0 : index" zero;
+  emit ctx "%s = arith.constant 1 : index" one;
+  emit ctx "%s = arith.constant %d : index" lanes_val width;
+
+  (* Compute number of full iterations: ceil(count / lanes) *)
+  let count_plus = fresh ctx "count_plus" in
+  let lanes_minus_one = fresh ctx "lanes_m1" in
+  emit ctx "%s = arith.constant %d : index" lanes_minus_one (width - 1);
+  emit ctx "%s = arith.addi %s, %s : index" count_plus count_idx lanes_minus_one;
+  emit ctx "%s = arith.divui %s, %s : index" num_iters count_plus lanes_val;
+
+  (* Emit scf.for loop *)
+  let iter_var = fresh ctx "i" in
+  emit ctx "scf.for %s = %s to %s step %s {" iter_var zero num_iters one;
+  ctx.indent <- ctx.indent + 1;
+
+  (* Compute offset for this iteration *)
+  let offset = fresh ctx "offset" in
+  emit ctx "%s = arith.muli %s, %s : index" offset iter_var lanes_val;
+
+  (* Store offset for field access *)
+  ctx.current_over_offset <- Some offset;
+
+  (* Compute tail mask for last iteration *)
+  let remaining = fresh ctx "remaining" in
+  let mask = fresh ctx "mask" in
+
+  emit ctx "%s = arith.subi %s, %s : index" remaining count_idx offset;
+  emit ctx "%s = vector.create_mask %s : %s" mask remaining mt;
+
+  (* Store mask in context for masked operations *)
+  ctx.current_over_mask <- Some mask;
+
+  (* Load chunk fields from pack memrefs using vector.load *)
+  (match Hashtbl.find_opt ctx.type_env.vars over.over_pack with
+   | Some (Pack (_, fields)) ->
+       List.iter (fun (field_name, _field_type) ->
+         let memref_key = over.over_pack ^ "." ^ field_name in
+         match Hashtbl.find_opt ctx.pack_memrefs memref_key with
+         | Some memref ->
+             let loaded = fresh ctx field_name in
+             emit ctx "%s = vector.load %s[%s] : memref<?xf32>, %s" loaded memref offset dt;
+             Hashtbl.add ctx.vars (over.over_chunk ^ "." ^ field_name) loaded
+         | None ->
+             emit ctx "// Warning: no memref for %s" memref_key
+       ) fields
+   | _ ->
+       emit ctx "// Warning: pack type not found for %s" over.over_pack);
+
+  (* Emit body statements, capture result of last expression *)
+  let result_val = ref None in
+  List.iter (fun stmt ->
+    match stmt.Ast.v with
+    | Ast.SExpr e ->
+        let (v, _) = emit_expr ctx e in
+        result_val := Some v
+    | _ ->
+        emit_stmt ctx stmt
+  ) over.over_body;
+
+  (* Store result to output memref if available *)
+  (match (!result_val, ctx.output_memref) with
+   | (Some result, Some out_memref) ->
+       emit ctx "vector.maskedstore %s[%s], %s, %s : memref<?xf32>, %s, %s"
+         out_memref offset mask result mt dt
    | (Some result, None) ->
        emit ctx "// Result %s computed but no output memref" result
    | _ ->
@@ -517,7 +657,8 @@ let rec emit_predicate ctx (pred: Ast.predicate) : string =
         | CLt -> "olt" | CLe -> "ole" | CGt -> "ogt"
         | CGe -> "oge" | CEq -> "oeq" | CNe -> "one"
       in
-      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result op_str lhs' rhs' vec_f32;
+      let dt = data_type ctx in
+      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result op_str lhs' rhs' dt;
       result
 
   | PIs (l, r) | PIsNot (l, r) ->
@@ -525,29 +666,36 @@ let rec emit_predicate ctx (pred: Ast.predicate) : string =
       let (rhs, _) = emit_expr ctx r in
       let result = fresh ctx "is" in
       let cmp = match pred.v with PIs _ -> "oeq" | _ -> "one" in
-      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result cmp lhs rhs vec_f32;
+      let dt = data_type ctx in
+      emit ctx "%s = arith.cmpf %s, %s, %s : %s" result cmp lhs rhs dt;
       result
 
   | PAnd (l, r) ->
       let lm = emit_predicate ctx l in
       let rm = emit_predicate ctx r in
       let result = fresh ctx "and" in
-      emit ctx "%s = arith.andi %s, %s : %s" result lm rm vec_i1;
+      let mt = mask_type ctx in
+      emit ctx "%s = arith.andi %s, %s : %s" result lm rm mt;
       result
 
   | POr (l, r) ->
       let lm = emit_predicate ctx l in
       let rm = emit_predicate ctx r in
       let result = fresh ctx "or" in
-      emit ctx "%s = arith.ori %s, %s : %s" result lm rm vec_i1;
+      let mt = mask_type ctx in
+      emit ctx "%s = arith.ori %s, %s : %s" result lm rm mt;
       result
 
   | PNot p ->
       let m = emit_predicate ctx p in
       let ones = fresh ctx "ones" in
       let result = fresh ctx "not" in
-      emit ctx "%s = arith.constant dense<true> : %s" ones vec_i1;
-      emit ctx "%s = arith.xori %s, %s : %s" result m ones vec_i1;
+      let mt = mask_type ctx in
+      if is_scalar_mode ctx then
+        emit ctx "%s = arith.constant 1 : %s" ones mt
+      else
+        emit ctx "%s = arith.constant dense<true> : %s" ones mt;
+      emit ctx "%s = arith.xori %s, %s : %s" result m ones mt;
       result
 
   | PTineRef name -> (
@@ -577,29 +725,56 @@ let emit_through ctx (th: Ast.through) =
     | Some e -> fst (emit_expr ctx e)
     | None ->
         let z = fresh ctx "zero" in
-        emit ctx "%s = arith.constant dense<0.0> : %s" z vec_f32;
+        let dt = data_type ctx in
+        if is_scalar_mode ctx then
+          emit ctx "%s = arith.constant 0.0 : %s" z dt
+        else
+          emit ctx "%s = arith.constant dense<0.0> : %s" z dt;
         z
   in
 
-  (* Emit body statements *)
-  List.iter (emit_stmt ctx) th.through_body;
-
-  (* Emit result expression *)
-  let (result_val, result_t) = emit_expr ctx th.through_result in
-
-  (* Use vector.mask to apply the mask *)
-  let masked = fresh ctx "masked" in
-  let result_type = mlir_type result_t in
-  emit ctx "%s = arith.select %s, %s, %s : %s, %s"
-    masked mask result_val passthru vec_i1 result_type;
-
-  (* Store the result binding *)
-  Hashtbl.add ctx.vars th.through_binding masked;
-  Hashtbl.add ctx.type_env.vars th.through_binding result_t;
-  emit ctx "// Through -> %s = %s" th.through_binding masked
+  (* In GPU mode, use scf.if for conditional execution *)
+  if is_scalar_mode ctx then begin
+    let result_var = fresh ctx "through_result" in
+    emit ctx "%s = scf.if %s -> (%s) {" result_var mask (data_type ctx);
+    ctx.indent <- ctx.indent + 1;
+    (* Emit body statements *)
+    List.iter (emit_stmt ctx) th.through_body;
+    (* Emit result expression *)
+    let (result_val, result_t) = emit_expr ctx th.through_result in
+    emit ctx "scf.yield %s : %s" result_val (mlir_type ctx result_t);
+    ctx.indent <- ctx.indent - 1;
+    emit ctx "} else {";
+    ctx.indent <- ctx.indent + 1;
+    emit ctx "scf.yield %s : %s" passthru (data_type ctx);
+    ctx.indent <- ctx.indent - 1;
+    emit ctx "}";
+    (* Store the result binding *)
+    Hashtbl.add ctx.vars th.through_binding result_var;
+    Hashtbl.add ctx.type_env.vars th.through_binding (Rack SFloat);
+    emit ctx "// Through -> %s = %s" th.through_binding result_var
+  end else begin
+    (* CPU mode: use arith.select *)
+    (* Emit body statements *)
+    List.iter (emit_stmt ctx) th.through_body;
+    (* Emit result expression *)
+    let (result_val, result_t) = emit_expr ctx th.through_result in
+    (* Use arith.select to apply the mask *)
+    let masked = fresh ctx "masked" in
+    let result_type = mlir_type ctx result_t in
+    let mt = mask_type ctx in
+    emit ctx "%s = arith.select %s, %s, %s : %s, %s"
+      masked mask result_val passthru mt result_type;
+    (* Store the result binding *)
+    Hashtbl.add ctx.vars th.through_binding masked;
+    Hashtbl.add ctx.type_env.vars th.through_binding result_t;
+    emit ctx "// Through -> %s = %s" th.through_binding masked
+  end
 
 (** Emit sweep block *)
 let emit_sweep ctx (sw: Ast.sweep) =
+  let dt = data_type ctx in
+  let mt = mask_type ctx in
   (* Build nested select chain from last to first *)
   let rec build_select arms acc =
     match arms with
@@ -612,7 +787,7 @@ let emit_sweep ctx (sw: Ast.sweep) =
              match Hashtbl.find_opt ctx.tines name with
              | Some mask ->
                  emit ctx "%s = arith.select %s, %s, %s : %s, %s"
-                   result mask val_ acc vec_i1 vec_f32;
+                   result mask val_ acc mt dt;
                  build_select rest result
              | None ->
                  build_select rest val_)
@@ -622,7 +797,10 @@ let emit_sweep ctx (sw: Ast.sweep) =
   in
   (* Start with undefined/zero and build up *)
   let init = fresh ctx "undef" in
-  emit ctx "%s = arith.constant dense<0.0> : %s" init vec_f32;
+  if is_scalar_mode ctx then
+    emit ctx "%s = arith.constant 0.0 : %s" init dt
+  else
+    emit ctx "%s = arith.constant dense<0.0> : %s" init dt;
   let result = build_select (List.rev sw.sweep_arms) init in
   Hashtbl.add ctx.vars sw.sweep_binding result;
   emit ctx "// Sweep -> %s = %s" sw.sweep_binding result;
@@ -630,15 +808,15 @@ let emit_sweep ctx (sw: Ast.sweep) =
 
 (** Emit crunch function *)
 let emit_crunch ctx name params _result body =
+  let dt = data_type ctx in
   (* Function signature *)
   let param_strs = List.mapi (fun i p ->
     let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
-    let pty = vec_f32 in  (* TODO: proper type *)
     Hashtbl.add ctx.vars pname (Printf.sprintf "%%arg%d" i);
-    Printf.sprintf "%%arg%d: %s" i pty
+    Printf.sprintf "%%arg%d: %s" i dt
   ) params in
 
-  emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) vec_f32;
+  emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) dt;
   ctx.indent <- ctx.indent + 1;
 
   (* Emit body *)
@@ -649,24 +827,25 @@ let emit_crunch ctx name params _result body =
     | Some v -> v
     | None -> "%arg0"
   in
-  emit ctx "func.return %s : %s" ret_val vec_f32;
+  emit ctx "func.return %s : %s" ret_val dt;
 
   ctx.indent <- ctx.indent - 1;
   emit ctx "}"
 
 (** Emit rake function *)
 let emit_rake ctx name params _result setup tines throughs sweep =
+  let dt = data_type ctx in
   (* Compute result type *)
   let result_type = match Typecheck.find_type ctx.type_env _result.result_name with
-    | Some t -> mlir_type t
-    | None -> vec_f32
+    | Some t -> mlir_type ctx t
+    | None -> dt
   in
 
   (* Function signature *)
   let param_strs = List.mapi (fun i p ->
     let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
     let is_scalar = match p with PScalar _ -> true | _ -> false in
-    let pty = if is_scalar then "f32" else vec_f32 in
+    let pty = if is_scalar then "f32" else dt in
     let arg = Printf.sprintf "%%arg%d" i in
     Hashtbl.add ctx.vars pname arg;
     Hashtbl.add ctx.type_env.vars pname
@@ -723,6 +902,7 @@ let rec emit_def ctx (def: Ast.def) =
 
 (** Emit run function with pack parameter expansion *)
 and emit_run ctx name params _result body =
+  let dt = data_type ctx in
   (* Expand pack parameters to memrefs, keep scalars as-is *)
   let param_counter = ref 0 in
   let param_strs = List.concat_map (fun p ->
@@ -778,7 +958,7 @@ and emit_run ctx name params _result body =
         | None -> Scalar SFloat
       in
       Hashtbl.add ctx.type_env.vars pname scalar_type;
-      let mlir_ty = mlir_type scalar_type in
+      let mlir_ty = mlir_type_w 1 scalar_type in  (* Scalars are always width 1 *)
       [Printf.sprintf "%s: %s" arg mlir_ty]
     end else begin
       let arg_idx = !param_counter in
@@ -786,7 +966,7 @@ and emit_run ctx name params _result body =
       let arg = Printf.sprintf "%%arg%d" arg_idx in
       Hashtbl.add ctx.vars pname arg;
       Hashtbl.add ctx.type_env.vars pname (Rack SFloat);
-      [Printf.sprintf "%s: %s" arg vec_f32]
+      [Printf.sprintf "%s: %s" arg dt]
     end
   ) params in
 
@@ -811,9 +991,14 @@ let emit_module ctx (m: Ast.module_) =
   emit ctx "// Module: %s" m.mod_name;
   List.iter (emit_def ctx) m.mod_defs
 
-(** Emit a program *)
-let emit_program env (prog: Ast.program) =
-  let ctx = create_ctx env in
+(** Emit a program with specified target *)
+let emit_program ?(target=CPU) env (prog: Ast.program) =
+  let ctx = create_ctx ~target env in
+  let target_comment = match target with
+    | CPU -> Printf.sprintf "CPU SIMD (width %d)" ctx.width
+    | GPU -> "GPU scalar (scf.parallel)"
+  in
+  emit ctx "// Target: %s" target_comment;
   emit ctx "module {";
   ctx.indent <- 1;
   List.iter (emit_module ctx) prog;
@@ -821,6 +1006,10 @@ let emit_program env (prog: Ast.program) =
   emit ctx "}";
   Buffer.contents ctx.buf
 
-(** Main entry point *)
+(** Main entry point - CPU mode (default) *)
 let emit env prog =
-  emit_program env prog
+  emit_program ~target:CPU env prog
+
+(** GPU mode entry point *)
+let emit_gpu env prog =
+  emit_program ~target:GPU env prog

@@ -4,18 +4,20 @@
 *)
 
 let usage = {|
-rake - vector-first language for CPU SIMD
+rake - vector-first language for CPU SIMD and GPU
 
 Usage:
-  rake <file.rk>                Parse and type-check
-  rake --emit-tokens <file.rk>  Emit tokens (for debugging)
-  rake --emit-ast <file.rk>     Emit AST (for debugging)
-  rake --emit-mlir <file.rk>    Emit MLIR
-  rake --version                Show version
-  rake --help                   Show this help
+  rake <file.rk>                     Parse and type-check
+  rake --emit-tokens <file.rk>       Emit tokens (for debugging)
+  rake --emit-ast <file.rk>          Emit AST (for debugging)
+  rake --emit-mlir <file.rk>         Emit MLIR (CPU mode, vector width 8)
+  rake --emit-mlir --gpu <file.rk>   Emit MLIR (GPU mode, scf.parallel)
+  rake --version                     Show version
+  rake --help                        Show this help
 
 Options:
-  --width <n>    Vector width (default: 8 for AVX2)
+  --gpu          Target GPU (emit scf.parallel with scalar ops)
+  --width <n>    Vector width for CPU mode (default: 8 for AVX2)
   --output <f>   Output file (default: stdout)
 |}
 
@@ -59,8 +61,11 @@ let emit_tokens filename =
 let emit_ast program =
   Rake.Ast.show_program program
 
-let emit_mlir env program =
-  Rake.Mlir.emit env program
+let emit_mlir ?(gpu=false) env program =
+  if gpu then
+    Rake.Mlir.emit_gpu env program
+  else
+    Rake.Mlir.emit env program
 
 let () =
   let args = Array.to_list Sys.argv |> List.tl in
@@ -92,6 +97,20 @@ let () =
             match Rake.Typecheck.check program with
             | Ok env ->
                 print_endline (emit_mlir env program)
+            | Error msg ->
+                prerr_endline msg;
+                exit 1)
+        | Error msg ->
+            prerr_endline msg;
+            exit 1)
+
+    | ["--emit-mlir"; "--gpu"; filename]
+    | ["--gpu"; "--emit-mlir"; filename] -> (
+        match parse_file filename with
+        | Ok program -> (
+            match Rake.Typecheck.check program with
+            | Ok env ->
+                print_endline (emit_mlir ~gpu:true env program)
             | Error msg ->
                 prerr_endline msg;
                 exit 1)

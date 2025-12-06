@@ -40,6 +40,14 @@
             llvmPackages.mlir
             llvmPackages.llvm
 
+            # GPU/Graphics for demos
+            SDL2
+            vulkan-headers
+            vulkan-loader
+            vulkan-tools
+            shaderc        # glslc for SPIR-V compilation
+            spirv-tools    # spirv-dis for inspection
+
             # Benchmarking tools
             hyperfine
             time
