@@ -19,6 +19,7 @@ type env = {
   vars: (ident, t) Hashtbl.t;       (** Variable bindings *)
   tines: (ident, unit) Hashtbl.t;   (** Declared tines (for validation) *)
   funcs: (ident, t list * t) Hashtbl.t;  (** Function signatures *)
+  locations: (ident, unit) Hashtbl.t;    (** Mutable locations (from :=) *)
 }
 
 let create_env () = {
@@ -26,6 +27,7 @@ let create_env () = {
   vars = Hashtbl.create 64;
   tines = Hashtbl.create 16;
   funcs = Hashtbl.create 32;
+  locations = Hashtbl.create 32;
 }
 
 let copy_env env = {
@@ -33,6 +35,7 @@ let copy_env env = {
   vars = Hashtbl.copy env.vars;
   tines = Hashtbl.copy env.tines;
   funcs = Hashtbl.copy env.funcs;
+  locations = Hashtbl.copy env.locations;
 }
 
 (** Error handling *)
@@ -98,16 +101,37 @@ let find_type env name =
   | Some t -> Some t
   | None -> Hashtbl.find_opt env.types (capitalize_first name)
 
+(** Expand a PSpread param into individual typed params.
+    Returns list of (name, type) pairs. *)
+let expand_spread env type_name names loc =
+  match find_type env type_name with
+  | Some (Stack (_, fields)) | Some (Single (_, fields)) ->
+      if List.length names <> List.length fields then
+        type_errorf loc "Type %s has %d fields, but %d names provided"
+          type_name (List.length fields) (List.length names);
+      List.map2 (fun name (_, field_type) -> (name, field_type)) names fields
+  | Some _ ->
+      type_errorf loc "Type %s is not a stack or single (cannot spread)" type_name
+  | None ->
+      type_errorf loc "Unknown type for spreading: %s" type_name
+
+(** Get types from a param, expanding spreads *)
+let param_types_of env p loc =
+  match p with
+  | PRack (_, Some ty) -> [typ_to_t env ty]
+  | PRack (_, None) -> [Rack SFloat]
+  | PScalar (_, Some ty) -> [typ_to_t env ty]
+  | PScalar (_, None) -> [Scalar SFloat]
+  | PSpread (names, type_name) ->
+      let expanded = expand_spread env type_name names loc in
+      List.map snd expanded
+
 (** Register function signatures *)
 let register_func_def env (def: def) =
   match def.v with
   | DCrunch (name, params, result, _) ->
-      let param_types = List.map (fun p ->
-        match p with
-        | PRack (_, Some ty) -> typ_to_t env ty
-        | PRack (_, None) -> Rack SFloat  (* default to float rack *)
-        | PScalar (_, Some ty) -> typ_to_t env ty
-        | PScalar (_, None) -> Scalar SFloat  (* default to scalar float *)
+      let param_types = List.concat_map (fun p ->
+        param_types_of env p def.loc
       ) params in
       let ret_type = match result.result_type with
         | Some ty -> typ_to_t env ty
@@ -115,19 +139,22 @@ let register_func_def env (def: def) =
       in
       Hashtbl.add env.funcs name (param_types, ret_type)
   | DRake (name, params, result, _, _, _, _) ->
-      let param_types = List.map (fun p ->
+      let param_types = List.concat_map (fun p ->
         match p with
-        | PRack (_pname, Some ty) -> typ_to_t env ty
+        | PRack (_pname, Some ty) -> [typ_to_t env ty]
         | PRack (pname, None) ->
             (* Look up if parameter name matches a type (e.g., ray -> Ray) *)
             (match find_type env pname with
-             | Some t -> t
-             | None -> Rack SFloat)
-        | PScalar (_pname, Some ty) -> typ_to_t env ty
+             | Some t -> [t]
+             | None -> [Rack SFloat])
+        | PScalar (_pname, Some ty) -> [typ_to_t env ty]
         | PScalar (pname, None) ->
             (match find_type env pname with
-             | Some (Single _ as t) -> t
-             | _ -> Scalar SFloat)
+             | Some (Single _ as t) -> [t]
+             | _ -> [Scalar SFloat])
+        | PSpread (names, type_name) ->
+            let expanded = expand_spread env type_name names def.loc in
+            List.map snd expanded
       ) params in
       let ret_type = match result.result_type with
         | Some ty -> typ_to_t env ty
@@ -139,12 +166,15 @@ let register_func_def env (def: def) =
       in
       Hashtbl.add env.funcs name (param_types, ret_type)
   | DRun (name, params, result, _) ->
-      let param_types = List.map (fun p ->
+      let param_types = List.concat_map (fun p ->
         match p with
-        | PRack (_, Some ty) -> typ_to_t env ty
-        | PRack (_, None) -> Rack SFloat
-        | PScalar (_, Some ty) -> typ_to_t env ty
-        | PScalar (_, None) -> Scalar SFloat
+        | PRack (_, Some ty) -> [typ_to_t env ty]
+        | PRack (_, None) -> [Rack SFloat]
+        | PScalar (_, Some ty) -> [typ_to_t env ty]
+        | PScalar (_, None) -> [Scalar SFloat]
+        | PSpread (names, type_name) ->
+            let expanded = expand_spread env type_name names def.loc in
+            List.map snd expanded
       ) params in
       let ret_type = match result.result_type with
         | Some ty -> typ_to_t env ty
@@ -287,6 +317,10 @@ let rec infer_expr env (expr: Ast.expr) : t =
   | EUnit -> Unit
   | ELambda (_, body) -> infer_expr env body
   | EPipe (_l, r) -> infer_expr env r
+  | EFusedPipe (l, r) ->
+      (* Fused pipe: verify fusion is possible, then return right-hand type *)
+      let _ = infer_expr env l in
+      infer_expr env r
 
 (** Infer binary operation result type *)
 and infer_binop t1 t2 op _loc =
@@ -310,10 +344,43 @@ and infer_unop t op _loc =
   | Neg | FNeg -> t
   | Not -> Mask
 
+(** Check if an expression is fusible (pure, no side effects) *)
+let rec is_fusible env (expr: Ast.expr) : bool =
+  match expr.v with
+  | EInt _ | EFloat _ | EBool _ -> true
+  | EVar _ | EScalarVar _ -> true
+  | EBinop (l, _, r) -> is_fusible env l && is_fusible env r
+  | EUnop (_, e) -> is_fusible env e
+  | ECall (name, args) ->
+      (* Only pure built-in functions are fusible *)
+      let pure_funcs = ["sqrt"; "sin"; "cos"; "tan"; "exp"; "log"; "abs";
+                        "floor"; "ceil"; "min"; "max"; "pow"; "atan2"] in
+      List.mem name pure_funcs && List.for_all (is_fusible env) args
+  | EField (e, _) -> is_fusible env e
+  | EBroadcast e -> is_fusible env e
+  | EReduce (_, e) -> is_fusible env e
+  | EFma (a, b, c) -> is_fusible env a && is_fusible env b && is_fusible env c
+  | ETuple es -> List.for_all (is_fusible env) es
+  | ELet (binding, body) ->
+      is_fusible env binding.bind_expr && is_fusible env body
+  | ELaneIndex | ELanes -> true
+  | EExtract (e, i) -> is_fusible env e && is_fusible env i
+  | EScan (_, e) | EShuffle (e, _) | EShift (e, _, _) | ERotate (e, _, _) ->
+      is_fusible env e
+  | EPipe (l, r) | EFusedPipe (l, r) -> is_fusible env l && is_fusible env r
+  | EUnit -> true
+  (* Side-effecting or unknown expressions are not fusible *)
+  | EScatter _ | EGather _ | ECompress _ | EExpand _ -> false
+  | ERecord _ | EWith _ | ETines _ | ELambda _ | EInsert _ | EOuter _ -> false
+
 (** Check a statement, return updated env *)
 let rec check_stmt env (stmt: stmt) : env =
   match stmt.v with
   | SLet binding ->
+      (* SSA: cannot rebind existing variables *)
+      if Hashtbl.mem env.vars binding.bind_name then
+        type_errorf stmt.loc "Cannot rebind '%s' (SSA violation, use := for mutable storage)"
+          binding.bind_name;
       let t = infer_expr env binding.bind_expr in
       let declared_t = match binding.bind_type with
         | Some ty -> Some (typ_to_t env ty)
@@ -327,9 +394,42 @@ let rec check_stmt env (stmt: stmt) : env =
       in
       Hashtbl.add env.vars binding.bind_name final_t;
       env
-  | SAssign (_name, e) ->
+
+  | SLocBind lb ->
+      (* Location binding: creates mutable storage *)
+      if Hashtbl.mem env.locations lb.loc_name then
+        type_errorf stmt.loc "Location '%s' already exists (use <- to mutate)"
+          lb.loc_name;
+      let t = infer_expr env lb.loc_expr in
+      let final_t = match lb.loc_type with
+        | Some ty ->
+            let dt = typ_to_t env ty in
+            if compatible dt t then dt
+            else type_errorf stmt.loc "Type mismatch: expected %s, got %s"
+              (show_concise dt) (show_concise t)
+        | None -> t
+      in
+      Hashtbl.add env.locations lb.loc_name ();
+      Hashtbl.add env.vars lb.loc_name final_t;
+      env
+
+  | SAssign (name, e) ->
+      (* Assignment: requires existing location *)
+      if not (Hashtbl.mem env.locations name) then
+        type_errorf stmt.loc "Cannot assign to '%s': not a location (use := to create)"
+          name;
       let _ = infer_expr env e in
       env
+
+  | SFused fb ->
+      (* Fused binding: verify fusion is possible *)
+      if not (is_fusible env fb.fused_expr) then
+        type_errorf stmt.loc "Expression for '%s' cannot be fused (contains side effects or non-pure calls)"
+          fb.fused_name;
+      let t = infer_expr env fb.fused_expr in
+      Hashtbl.add env.vars fb.fused_name t;
+      env
+
   | SExpr e ->
       let _ = infer_expr env e in
       env
@@ -419,7 +519,7 @@ let check_sweep env (sw: sweep) expected_loc : t =
 let check_rake env _name params result setup tines throughs sweep loc =
   let env' = copy_env env in
 
-  (* Add parameters to environment *)
+  (* Add parameters to environment (rake uses name-based inference) *)
   List.iter (fun p ->
     match p with
     | PRack (pname, Some ty) ->
@@ -436,6 +536,12 @@ let check_rake env _name params result setup tines throughs sweep loc =
         (match find_type env' pname with
          | Some (Single _ as t) -> Hashtbl.add env'.vars pname t
          | _ -> Hashtbl.add env'.vars pname (Scalar SFloat))
+    | PSpread (names, type_name) ->
+        (* Spread type fields to named parameters *)
+        let expanded = expand_spread env' type_name names loc in
+        List.iter (fun (name, t) ->
+          Hashtbl.add env'.vars name t
+        ) expanded
   ) params;
 
   (* Check setup statements *)
@@ -472,22 +578,31 @@ let check_rake env _name params result setup tines throughs sweep loc =
     type_errorf loc "Return type mismatch: expected %s, got %s"
       (show_concise expected_t) (show_concise sweep_t)
 
-(** Check crunch function definition *)
-let check_crunch env _name params _result body _loc =
-  let env' = copy_env env in
-
-  (* Add parameters *)
+(** Add params to environment, expanding spreads *)
+let add_params_to_env env params loc =
   List.iter (fun p ->
     match p with
     | PRack (pname, Some ty) ->
-        Hashtbl.add env'.vars pname (typ_to_t env' ty)
+        Hashtbl.add env.vars pname (typ_to_t env ty)
     | PRack (pname, None) ->
-        Hashtbl.add env'.vars pname (Rack SFloat)
+        Hashtbl.add env.vars pname (Rack SFloat)
     | PScalar (pname, Some ty) ->
-        Hashtbl.add env'.vars pname (typ_to_t env' ty)
+        Hashtbl.add env.vars pname (typ_to_t env ty)
     | PScalar (pname, None) ->
-        Hashtbl.add env'.vars pname (Scalar SFloat)
-  ) params;
+        Hashtbl.add env.vars pname (Scalar SFloat)
+    | PSpread (names, type_name) ->
+        let expanded = expand_spread env type_name names loc in
+        List.iter (fun (name, t) ->
+          Hashtbl.add env.vars name t
+        ) expanded
+  ) params
+
+(** Check crunch function definition *)
+let check_crunch env _name params _result body loc =
+  let env' = copy_env env in
+
+  (* Add parameters, expanding any spreads *)
+  add_params_to_env env' params loc;
 
   (* Check body *)
   List.iter (fun s -> ignore (check_stmt env' s)) body

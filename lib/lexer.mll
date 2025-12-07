@@ -46,7 +46,7 @@ let () = List.iter (fun (k, v) -> Hashtbl.add keywords k v) [
   ("over", OVER); ("repeat", REPEAT); ("times", TIMES); ("until", UNTIL);
 
   (* Bindings *)
-  ("let", LET); ("fun", FUN); ("with", WITH);
+  ("let", LET); ("fun", FUN); ("with", WITH); ("as", AS);
 
   (* Lane operations *)
   ("lanes", LANES);
@@ -112,6 +112,7 @@ rule token = parse
 
   (* Multi-character operators *)
   | "|>" { PIPE }
+  | "<|" { FUSED_LEFT }
   | "->" { ARROW }
   | "<-" { ASSIGN }
   | ":=" { COLONEQ }
@@ -224,7 +225,7 @@ let show_token = function
   | THROUGH -> "THROUGH" | SWEEP -> "SWEEP" | ELSE -> "ELSE"
   | RESULTS -> "RESULTS" | IN -> "IN"
   | OVER -> "OVER" | REPEAT -> "REPEAT" | TIMES -> "TIMES" | UNTIL -> "UNTIL"
-  | LET -> "LET" | FUN -> "FUN" | WITH -> "WITH"
+  | LET -> "LET" | FUN -> "FUN" | WITH -> "WITH" | AS -> "AS"
   | LANES -> "LANES" | FMA -> "FMA" | OUTER -> "OUTER"
   | COMPRESS -> "COMPRESS" | EXPAND -> "EXPAND" | BROADCAST -> "BROADCAST"
   | TRUE -> "TRUE" | FALSE -> "FALSE"
@@ -232,7 +233,8 @@ let show_token = function
   | PLUS -> "PLUS" | MINUS -> "MINUS" | STAR -> "STAR" | SLASH -> "SLASH"
   | PERCENT -> "PERCENT" | LT -> "LT" | LE -> "LE" | GT -> "GT" | GE -> "GE"
   | EQ -> "EQ" | NE -> "NE" | AMPAMP -> "AMPAMP" | PIPEPIPE -> "PIPEPIPE"
-  | BANG -> "BANG" | PIPE -> "PIPE" | ARROW -> "ARROW" | ASSIGN -> "ASSIGN"
+  | BANG -> "BANG" | PIPE -> "PIPE" | FUSED_LEFT -> "FUSED_LEFT"
+  | ARROW -> "ARROW" | ASSIGN -> "ASSIGN"
   | COLONEQ -> "COLONEQ" | SHUFFLE -> "SHUFFLE" | INTERLEAVE -> "INTERLEAVE"
   | SHL -> "SHL" | SHR -> "SHR" | ROL -> "ROL" | ROR -> "ROR"
   | COMPRESS_STORE -> "COMPRESS_STORE" | EXPAND_LOAD -> "EXPAND_LOAD"

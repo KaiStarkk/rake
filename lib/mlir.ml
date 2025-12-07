@@ -499,6 +499,33 @@ let rec emit_expr ctx (expr: Ast.expr) : string * Types.t =
       Hashtbl.add ctx.type_env.vars binding.bind_name t;
       emit_expr ctx body
 
+  | EFusedPipe (l, r) ->
+      (* Fused pipe: evaluate right-to-left, fusion guaranteed by type checker *)
+      let (lhs, _) = emit_expr ctx l in
+      (* If r is a function call, apply lhs as first argument *)
+      (match r.v with
+       | ECall (name, args) ->
+           let arg_results = List.map (emit_expr ctx) args in
+           let all_args = lhs :: List.map fst arg_results in
+           let all_types = List.map (fun (_, t) -> mlir_type ctx t) arg_results in
+           let result = fresh ctx "fused" in
+           let dt = data_type ctx in
+           emit ctx "%s = func.call @%s(%s) : (%s, %s) -> %s"
+             result name
+             (String.concat ", " all_args)
+             dt (String.concat ", " all_types)
+             dt;
+           (result, Rack SFloat)
+       | EVar fname ->
+           (* Simple function application *)
+           let result = fresh ctx "fused" in
+           let dt = data_type ctx in
+           emit ctx "%s = func.call @%s(%s) : (%s) -> %s" result fname lhs dt dt;
+           (result, Rack SFloat)
+       | _ ->
+           (* Fall back to evaluating r and treating as pipe *)
+           emit_expr ctx r)
+
   (* Explicitly fail on unhandled expressions - no silent fallback *)
   | ELambda _ ->
       failwith "Unhandled expression: ELambda (closures not yet implemented)"
@@ -545,13 +572,32 @@ and get_field_type t field =
 let rec emit_stmt ctx (stmt: Ast.stmt) =
   match stmt.v with
   | SLet binding ->
+      (* SSA binding: immutable, no storage *)
       let (v, t) = emit_expr ctx binding.bind_expr in
       Hashtbl.add ctx.vars binding.bind_name v;
       Hashtbl.add ctx.type_env.vars binding.bind_name t
 
+  | SLocBind lb ->
+      (* Location binding: introduces mutable storage *)
+      let (v, t) = emit_expr ctx lb.loc_expr in
+      Hashtbl.add ctx.vars lb.loc_name v;
+      Hashtbl.add ctx.type_env.vars lb.loc_name t;
+      emit ctx "// Location %s := %s" lb.loc_name v
+
   | SAssign (name, e) ->
+      (* Assignment: mutates existing location (must exist) *)
+      if not (Hashtbl.mem ctx.vars name) then
+        failwith (Printf.sprintf "Cannot assign to undefined location: %s" name);
       let (v, _) = emit_expr ctx e in
       Hashtbl.replace ctx.vars name v
+
+  | SFused fb ->
+      (* Fused binding: must fuse, no intermediate storage *)
+      (* Type checker guarantees this is fusible - just emit as SSA *)
+      let (v, t) = emit_expr ctx fb.fused_expr in
+      Hashtbl.add ctx.vars fb.fused_name v;
+      Hashtbl.add ctx.type_env.vars fb.fused_name t
+      (* No comment - these are invisible in the output by design *)
 
   | SExpr e ->
       ignore (emit_expr ctx e)
@@ -918,15 +964,32 @@ let emit_sweep ctx (sw: Ast.sweep) =
   emit ctx "// Sweep -> %s = %s" sw.sweep_binding result;
   result
 
+(** Flatten params, expanding spreads to individual names *)
+let flatten_params ctx params =
+  List.concat_map (fun p ->
+    match p with
+    | PRack (n, _) -> [(n, false)]  (* name, is_scalar *)
+    | PScalar (n, _) -> [(n, true)]
+    | PSpread (names, type_name) ->
+        (* Look up type to get field types *)
+        (match Hashtbl.find_opt ctx.types type_name with
+         | Some (Stack (_, fields)) | Some (Single (_, fields)) ->
+             List.map2 (fun n (_, _) -> (n, false)) names fields
+         | _ ->
+             (* Fallback: treat as rack params *)
+             List.map (fun n -> (n, false)) names)
+  ) params
+
 (** Emit crunch function *)
 let emit_crunch ctx name params _result body =
   let dt = data_type ctx in
+  (* Flatten params, expanding spreads *)
+  let flat_params = flatten_params ctx params in
   (* Function signature *)
-  let param_strs = List.mapi (fun i p ->
-    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
+  let param_strs = List.mapi (fun i (pname, _is_scalar) ->
     Hashtbl.add ctx.vars pname (Printf.sprintf "%%arg%d" i);
     Printf.sprintf "%%arg%d: %s" i dt
-  ) params in
+  ) flat_params in
 
   emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) dt;
   ctx.indent <- ctx.indent + 1;
@@ -953,17 +1016,17 @@ let emit_rake ctx name params _result setup tines throughs sweep =
     | None -> dt
   in
 
+  (* Flatten params, expanding spreads *)
+  let flat_params = flatten_params ctx params in
   (* Function signature *)
-  let param_strs = List.mapi (fun i p ->
-    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
-    let is_scalar = match p with PScalar _ -> true | _ -> false in
+  let param_strs = List.mapi (fun i (pname, is_scalar) ->
     let pty = if is_scalar then "f32" else dt in
     let arg = Printf.sprintf "%%arg%d" i in
     Hashtbl.add ctx.vars pname arg;
     Hashtbl.add ctx.type_env.vars pname
       (if is_scalar then Scalar SFloat else Rack SFloat);
     Printf.sprintf "%s: %s" arg pty
-  ) params in
+  ) flat_params in
 
   emit ctx "func.func @%s(%s) -> %s attributes {llvm.alwaysinline} {" name (String.concat ", " param_strs) result_type;
   ctx.indent <- ctx.indent + 1;
@@ -1018,19 +1081,30 @@ and emit_run ctx name params _result body =
   (* Expand pack parameters to memrefs, keep scalars as-is *)
   let param_counter = ref 0 in
   let param_strs = List.concat_map (fun p ->
-    let pname = match p with PRack (n, _) | PScalar (n, _) -> n in
-    let pty_opt = match p with
-      | PRack (_, t) -> t
-      | PScalar (_, t) -> t
-    in
-    (* Check if this is a pack parameter *)
-    let is_pack = match pty_opt with
-      | Some ty -> (match ty.v with TPack _ -> true | _ -> false)
-      | None -> false
-    in
-    let is_scalar = match p with PScalar _ -> true | _ -> false in
+    match p with
+    | PSpread (names, _type_name) ->
+        (* Spreads in run expand to individual rack params *)
+        List.map (fun pname ->
+          let arg_idx = !param_counter in
+          incr param_counter;
+          let arg = Printf.sprintf "%%arg%d" arg_idx in
+          Hashtbl.add ctx.vars pname arg;
+          Hashtbl.add ctx.type_env.vars pname (Rack SFloat);
+          Printf.sprintf "%s: %s" arg dt
+        ) names
+    | _ ->
+        let (pname, pty_opt, is_scalar) = match p with
+          | PRack (n, t) -> (n, t, false)
+          | PScalar (n, t) -> (n, t, true)
+          | PSpread _ -> failwith "unreachable"
+        in
+        (* Check if this is a pack parameter *)
+        let is_pack = match pty_opt with
+          | Some ty -> (match ty.v with TPack _ -> true | _ -> false)
+          | None -> false
+        in
 
-    if is_pack then begin
+        if is_pack then begin
       (* Look up pack type and expand to memrefs for each field *)
       let pack_type_name = match pty_opt with
         | Some ty -> (match ty.v with TPack n -> n | _ -> pname)

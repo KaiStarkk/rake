@@ -105,6 +105,7 @@ and expr_kind =
   | ECall of ident * expr list         (** f(a, b, c) *)
   | ELambda of param list * expr       (** fun x y -> body *)
   | EPipe of expr * expr               (** x |> f *)
+  | EFusedPipe of expr * expr          (** x <| f (right-to-left, must fuse) *)
 
   (* Bindings *)
   | ELet of binding * expr             (** let x = e1 in e2 *)
@@ -153,10 +154,11 @@ and expr_kind =
   (* Unit *)
   | EUnit                              (** () *)
 
-(** Parameter: either rack (default) or scalar (angle brackets) *)
+(** Parameter: either rack (default), scalar (angle brackets), or spread type *)
 and param =
   | PRack of ident * typ option        (** x or (x : float rack) *)
   | PScalar of ident * typ option      (** <x> or (<x> : float) *)
+  | PSpread of ident list * ident      (** TypeName as x y z - spreads type fields to names *)
 
 (** Binding in let expressions *)
 and binding = {
@@ -226,11 +228,26 @@ and sweep_arm = {
   arm_value: expr;
 }
 
+(** Location binding: introduces mutable storage *)
+and loc_binding = {
+  loc_name: ident;
+  loc_type: typ option;
+  loc_expr: expr;
+}
+
+(** Fused binding: must fuse, no intermediate storage *)
+and fused_binding = {
+  fused_name: ident;
+  fused_expr: expr;
+}
+
 (** Statements (in through/run blocks) *)
 and stmt = stmt_kind node
 and stmt_kind =
-  | SLet of binding                    (** let x = e *)
-  | SAssign of ident * expr            (** x <- e *)
+  | SLet of binding                    (** let x = e (SSA, immutable) *)
+  | SLocBind of loc_binding            (** x := e (introduces mutable storage) *)
+  | SAssign of ident * expr            (** x <- e (mutates existing location) *)
+  | SFused of fused_binding            (** | x <| e (must fuse, no intermediate) *)
   | SExpr of expr                      (** expression statement *)
   | SOver of over_loop                 (** over pack, count |> chunk: body *)
 

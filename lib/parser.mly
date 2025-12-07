@@ -39,7 +39,7 @@ let mk_node v startpos endpos = { v; loc = mk_loc startpos endpos }
 %token OVER REPEAT TIMES UNTIL
 
 (* Tokens: Bindings *)
-%token LET FUN WITH
+%token LET FUN WITH AS
 
 (* Tokens: Lane operations *)
 %token LANES FMA OUTER COMPRESS EXPAND BROADCAST
@@ -51,7 +51,7 @@ let mk_node v startpos endpos = { v; loc = mk_loc startpos endpos }
 %token PLUS MINUS STAR SLASH PERCENT
 %token LT LE GT GE EQ NE
 %token AMPAMP PIPEPIPE BANG
-%token PIPE ARROW ASSIGN COLONEQ
+%token PIPE FUSED_LEFT ARROW ASSIGN COLONEQ
 %token SHUFFLE INTERLEAVE
 %token SHL SHR ROL ROR
 %token COMPRESS_STORE EXPAND_LOAD
@@ -77,7 +77,7 @@ let mk_node v startpos endpos = { v; loc = mk_loc startpos endpos }
 
 (* Precedence: lowest to highest *)
 %right ARROW
-%left PIPE
+%left PIPE FUSED_LEFT
 %left PIPEPIPE OR
 %left AMPAMP AND
 %left EQ NE
@@ -143,12 +143,36 @@ field:
       { field_name = name; field_type = t }
     }
 
-(* crunch name params -> result: body *)
+(* crunch name params -> result: body
+   Supports three forms:
+   1. Bare params:    crunch dot ax ay az -> d:
+   2. Parenthesized:  crunch dot (ax, ay, az) -> d:
+   3. Type spreading: crunch dot (Vec3 as ax ay az) -> d:
+*)
 crunch_def:
+  (* Original: bare space-separated params *)
   | CRUNCH name = IDENT ps = list(param) ARROW r = result_spec COLON
     body = stmt_list {
       mk_node (DCrunch (name, ps, r, body)) $startpos $endpos
     }
+  (* New: comma-separated params in parens, with optional type spreading *)
+  | CRUNCH name = IDENT LPAREN ps = separated_nonempty_list(COMMA, crunch_param) RPAREN ARROW r = result_spec COLON
+    body = stmt_list {
+      mk_node (DCrunch (name, List.concat ps, r, body)) $startpos $endpos
+    }
+
+(* Parameters inside parenthesized crunch definition *)
+crunch_param:
+  (* Single untyped rack param: ax *)
+  | name = IDENT { [PRack (name, None)] }
+  (* Single typed param: ax : float rack *)
+  | name = IDENT COLON t = typ { [PRack (name, Some t)] }
+  (* Single scalar param: <x> *)
+  | name = SCALAR_IDENT { [PScalar (name, None)] }
+  (* Single typed scalar: <x> : float *)
+  | name = SCALAR_IDENT COLON t = typ { [PScalar (name, Some t)] }
+  (* Type spreading: Vec3 as ax ay az *)
+  | tname = IDENT AS names = nonempty_list(IDENT) { [PSpread (names, tname)] }
 
 (* ═══════════════════════════════════════════════════════════════════ *)
 (* Rake definition with tine/through/sweep                              *)
@@ -454,6 +478,15 @@ stmt_list:
 stmt:
   | LET b = binding { mk_node (SLet b) $startpos $endpos }
   | name = IDENT ASSIGN e = expr { mk_node (SAssign (name, e)) $startpos $endpos }
+  (* Location binding: x := e (introduces mutable storage) *)
+  | name = IDENT COLONEQ e = expr { mk_node (SLocBind { loc_name = name; loc_type = None; loc_expr = e }) $startpos $endpos }
+  | LPAREN name = IDENT COLON t = typ RPAREN COLONEQ e = expr {
+      mk_node (SLocBind { loc_name = name; loc_type = Some t; loc_expr = e }) $startpos $endpos
+    }
+  (* Fused binding: | x <| e (must fuse, no intermediate storage) *)
+  | PIPE_CHAR name = IDENT FUSED_LEFT e = expr {
+      mk_node (SFused { fused_name = name; fused_expr = e }) $startpos $endpos
+    }
   | o = over_stmt { o }
   | e = expr { mk_node (SExpr e) $startpos $endpos }
 
@@ -510,6 +543,9 @@ expr:
 expr_pipe:
   | l = expr_pipe PIPE r = expr_or {
       mk_node (EPipe (l, r)) $startpos $endpos
+    }
+  | l = expr_pipe FUSED_LEFT r = expr_or {
+      mk_node (EFusedPipe (l, r)) $startpos $endpos
     }
   | e = expr_or { e }
 
